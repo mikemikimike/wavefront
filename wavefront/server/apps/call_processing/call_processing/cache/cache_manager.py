@@ -2,8 +2,6 @@ import json
 import time
 from typing import Any, Dict, Optional, Union
 
-from azure.core.exceptions import ClientAuthenticationError
-from azure.identity import DefaultAzureCredential
 from call_processing.log.logger import logger
 
 from redis import Connection
@@ -14,7 +12,6 @@ from redis import Redis
 from redis import RedisError
 from redis import SSLConnection
 from redis import TimeoutError
-from redis.credentials import CredentialProvider
 from redis.exceptions import OutOfMemoryError
 from tenacity import retry
 from tenacity import retry_if_exception
@@ -36,27 +33,6 @@ def _is_retryable_redis_error(exc: BaseException) -> bool:
     return isinstance(exc, (RedisError, ConnectionError, TimeoutError))
 
 
-class AzureManagedRedisProvider(CredentialProvider):
-    """
-    Adapter to bridge Azure Identity with Redis CredentialProvider.
-    Azure Managed Redis requires 'default' as the username and the
-    Entra ID access token as the password.
-    """
-
-    def __init__(self, username: str = 'default'):
-        self.credential = DefaultAzureCredential()
-        self.scope = 'https://redis.azure.com/.default'
-        self.username = username
-
-    def get_credentials(self):
-        try:
-            token = self.credential.get_token(self.scope)
-            return (self.username, token.token)
-        except ClientAuthenticationError as e:
-            logger.error(f'Azure authentication failed: {e}')
-            raise
-
-
 class CacheManager:
     def __init__(
         self,
@@ -74,8 +50,6 @@ class CacheManager:
         redis_protocol: str = 'redis',
         redis_password: str | None = None,
         redis_db: int = 0,
-        redis_username: str = 'default',
-        cloud_provider: str = '',
         pool_timeout: float = 2.0,
     ):
         """
@@ -94,8 +68,6 @@ class CacheManager:
         self.redis_protocol = redis_protocol
         self.redis_password = redis_password or None
         self.redis_db = int(redis_db)
-        self.redis_username = redis_username
-        self.cloud_provider = (cloud_provider or '').lower()
         self.pool_timeout = float(pool_timeout)
         self.max_retries = max_retries
         self.initial_backoff = initial_backoff
@@ -123,7 +95,6 @@ class CacheManager:
             port = self.redis_port
             protocol = self.redis_protocol
             password = self.redis_password
-            cloud_provider = self.cloud_provider
 
             connection_class = Connection
             if protocol == 'rediss' or port == 10000:
@@ -145,14 +116,7 @@ class CacheManager:
                 'decode_responses': True,
             }
 
-            if cloud_provider == 'azure' and not password:
-                logger.info(
-                    'Configuring Azure Entra ID (Workload Identity) authentication'
-                )
-                pool_kwargs['credential_provider'] = AzureManagedRedisProvider(
-                    username=self.redis_username
-                )
-            elif password:
+            if password:
                 pool_kwargs['password'] = password
 
             # Blocking: when every connection is busy, wait briefly for one to
