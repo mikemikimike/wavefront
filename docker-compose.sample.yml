@@ -47,13 +47,25 @@ services:
     networks:
       - floware-network
 
-  # Redis for Floware
+  # Redis for Floware — also the Celery broker and result backend. maxmemory is
+  # per-instance, not per-db, so the broker and the app cache draw on the same
+  # budget. noeviction keeps Redis from dropping queued or unacked tasks under
+  # pressure: writes get refused, reads keep working, and the worker drains
+  # what is already queued.
   redis-floware:
     image: redis:7.4
     container_name: redis-floware
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
+    command:
+      - redis-server
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-2gb}
+      - --maxmemory-policy
+      - noeviction
+      - --maxmemory-clients
+      - ${REDIS_MAXMEMORY_CLIENTS:-5%}
     ports:
       - '6379:6379'
     healthcheck:
@@ -64,13 +76,23 @@ services:
     networks:
       - floware-network
 
-  # Redis for Call Processing
+  # Redis for Call Processing — a cache only, no Celery broker on this one, so
+  # it gets a smaller budget than redis-floware. noeviction all the same: the
+  # call_processing cache_manager has no graceful-degradation path.
   redis-call-processing:
     image: redis:7.4
     container_name: redis-call-processing
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
+    command:
+      - redis-server
+      - --maxmemory
+      - ${REDIS_CALL_PROCESSING_MAXMEMORY:-512mb}
+      - --maxmemory-policy
+      - noeviction
+      - --maxmemory-clients
+      - ${REDIS_MAXMEMORY_CLIENTS:-5%}
     ports:
       - '6380:6379'
     healthcheck:

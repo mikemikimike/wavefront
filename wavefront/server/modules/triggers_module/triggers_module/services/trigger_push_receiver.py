@@ -2,6 +2,8 @@ import uuid
 from typing import Any, Dict, Optional
 from uuid import UUID
 
+from agents_module.utils.celery_backpressure import ensure_queue_capacity
+from agents_module.utils.celery_settings import CeleryProducerSettings
 from celery import Celery
 from common_module.log.logger import logger
 from db_repo_module.models.agentic_trigger import AgenticTrigger
@@ -37,10 +39,12 @@ class TriggerPushReceiver:
         trigger_repository: SQLAlchemyRepository[AgenticTrigger],
         email_connection_service: EmailConnectionService,
         celery_client: Celery,
+        celery_settings: CeleryProducerSettings | None = None,
     ):
         self._triggers = trigger_repository
         self._connections = email_connection_service
         self._celery = celery_client
+        self._celery_settings = celery_settings or CeleryProducerSettings()
 
     async def handle_push(
         self,
@@ -111,6 +115,18 @@ class TriggerPushReceiver:
         push_message_id = (raw_payload.get('message') or {}).get('messageId') or str(
             uuid.uuid4()
         )
+
+        # Raises QueueBackpressure, which the controller turns into a 429.
+        # Deliberately after signature verification and the cursor check, so an
+        # unverified caller cannot probe queue state and a 429 only ever goes
+        # to a push we would have accepted. Nothing above this has a side
+        # effect, so a refusal here costs nothing.
+        #
+        # A non-2xx is a nack: Pub/Sub redelivers with its own backoff, holding
+        # the event for the subscription's retention window. That makes the
+        # subscription a durable overflow buffer, which is why this refuses
+        # rather than dropping the event — a dropped push loses the email.
+        await ensure_queue_capacity(self._celery, self._celery_settings)
 
         self._celery.send_task(
             _TRIGGER_EVENT_TASK_NAME,

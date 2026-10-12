@@ -15,10 +15,25 @@ from redis import RedisError
 from redis import SSLConnection
 from redis import TimeoutError
 from redis.credentials import CredentialProvider
+from redis.exceptions import OutOfMemoryError
 from tenacity import retry
-from tenacity import retry_if_exception_type
+from tenacity import retry_if_exception
 from tenacity import stop_after_attempt
 from tenacity import wait_exponential
+
+
+def _is_retryable_redis_error(exc: BaseException) -> bool:
+    """Whether a failed Redis call is worth attempting again.
+
+    Mirrors db_repo_module's CacheManager, which this class duplicates. OOM is
+    excluded because `maxmemory` is a standing refusal — the later attempts
+    fail for the same reason the first did, and the 1s/2s backoff between them
+    runs on the event loop (the cache endpoints and services call these
+    synchronously from async handlers).
+    """
+    if isinstance(exc, OutOfMemoryError):
+        return False
+    return isinstance(exc, (RedisError, ConnectionError, TimeoutError))
 
 
 class AzureManagedRedisProvider(CredentialProvider):
@@ -163,7 +178,7 @@ class CacheManager:
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((RedisError, ConnectionError, TimeoutError)),
+        retry=retry_if_exception(_is_retryable_redis_error),
     )
     def add(
         self,
@@ -184,7 +199,7 @@ class CacheManager:
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((RedisError, ConnectionError, TimeoutError)),
+        retry=retry_if_exception(_is_retryable_redis_error),
     )
     def get_str(self, key: str, default: Any = None) -> Optional[str]:
         try:
@@ -244,19 +259,40 @@ class CacheManager:
             logger.error(f'Error getting key: {key} from cache: {e}')
             raise
 
+    # Batch size for both the SCAN cursor and the DEL argument list below.
+    _INVALIDATE_BATCH = 500
+
     def invalidate_query(self, pattern: str) -> int:
-        """Remove all keys matching the given pattern"""
+        """Remove all keys matching the given pattern.
+
+        SCAN rather than KEYS, matching db_repo_module's CacheManager. KEYS
+        walks the whole keyspace in one blocking call and returns every match
+        in a single reply, which is both a server stall and the client
+        output-buffer growth that `maxmemory-clients` now kills connections
+        over. Currently unreferenced in this app, but left correct so it is not
+        a trap for the first caller.
+        """
         try:
-            # Get all keys matching the pattern
             search_pattern = f'{self.namespace}/{pattern}'
-            keys = self.redis.keys(search_pattern)
-            if keys:
+            deleted = 0
+            batch: list = []
+            for key in self.redis.scan_iter(
+                match=search_pattern, count=self._INVALIDATE_BATCH
+            ):
+                batch.append(key)
+                if len(batch) >= self._INVALIDATE_BATCH:
+                    deleted += self.redis.delete(*batch)
+                    batch.clear()
+            if batch:
+                deleted += self.redis.delete(*batch)
+
+            if deleted:
                 logger.info(
-                    f'Invalidating {len(keys)} cache keys matching pattern: {pattern}'
+                    f'Invalidated {deleted} cache keys matching pattern: {pattern}'
                 )
-                return self.redis.delete(*keys)
-            logger.info(f'No cache keys found matching pattern: {pattern}')
-            return 0
+            else:
+                logger.info(f'No cache keys found matching pattern: {pattern}')
+            return deleted
         except (RedisError, ConnectionError, TimeoutError) as e:
             logger.error(f'Error removing keys with pattern: {pattern} from cache: {e}')
             raise

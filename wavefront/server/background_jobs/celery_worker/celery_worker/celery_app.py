@@ -25,8 +25,17 @@ app.conf.update(
     task_acks_late=True,  # Only ack after successful processing
     task_reject_on_worker_lost=True,  # Re-queue on worker crash
     worker_prefetch_multiplier=1,  # Fair task distribution
-    task_track_started=True,
     task_default_queue='{celery}',
+    # Nothing reads task results: there is no AsyncResult anywhere in the repo,
+    # `celery_task_id` is only stored and echoed back, and execution status
+    # comes from Postgres plus the async_agentic_exec:results stream. So every
+    # `celery-task-meta-*` key written here was memory nobody spends. That is
+    # not free on a capped instance the broker shares with the floware cache —
+    # and on Azure Managed Redis, which is single-db, the result keys land in
+    # the same db as the queue itself rather than in db 1. `task_track_started`
+    # went with it: STARTED is a result-backend write, so it was costing a
+    # round trip per task to record a state no reader consults.
+    task_ignore_result=True,
     worker_enable_remote_control=False,
     # An idle worker's result-backend socket gets closed by Azure Redis / the LB
     # after minutes of no traffic, and redis-py only notices on the next command.

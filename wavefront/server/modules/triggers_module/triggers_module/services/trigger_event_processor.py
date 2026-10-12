@@ -181,6 +181,13 @@ class TriggerEventProcessor:
             'email_from': event.sender or '',
         }
 
+        # enforce_queue_limit=False: this runs inside the Celery worker, on an
+        # event that was already admitted and gated at the webhook. A refusal
+        # here would not defer the work, it would lose it — _handle_single_event
+        # catches the exception and marks the trigger event row failed with
+        # processed_at set, and CELERY_TASK_MAX_RETRIES defaults to 0, so
+        # nothing would ever pick it up again. Pressure is applied once, at
+        # ingress; the fan-out from here is bounded by the events admitted there.
         if trigger.entity_type == 'agent':
             return await self._async_exec.create_and_enqueue_agent(
                 agent_id=trigger.entity_id,
@@ -189,6 +196,7 @@ class TriggerEventProcessor:
                 output_json_enabled=True,
                 access_token=None,
                 app_key=None,
+                enforce_queue_limit=False,
             )
 
         workflow = await self._workflows.find_one(id=trigger.entity_id)
@@ -203,4 +211,5 @@ class TriggerEventProcessor:
             output_json_enabled=False,
             access_token=None,
             app_key=None,
+            enforce_queue_limit=False,
         )

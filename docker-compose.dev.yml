@@ -19,11 +19,22 @@ services:
     networks:
       - floware-network
 
+  # Shared by the Celery broker, the Celery result backend and the floware app
+  # cache. noeviction keeps Redis from dropping queued or unacked tasks under
+  # pressure.
   redis:
     image: redis:7.4
     container_name: redis
     security_opt:
       - no-new-privileges:true
+    command:
+      - redis-server
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-2gb}
+      - --maxmemory-policy
+      - noeviction
+      - --maxmemory-clients
+      - ${REDIS_MAXMEMORY_CLIENTS:-5%}
     ports:
       - "6379:6379"
     networks:

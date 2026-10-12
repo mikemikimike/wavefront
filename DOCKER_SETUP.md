@@ -173,6 +173,21 @@ adding one file there.
 | `REDIS_PROTOCOL` | Protocol (default: `redis`) |
 | `REDIS_HOST` | Redis host (default: `redis-floware`) |
 | `REDIS_PORT` | Redis port (default: `6379`) |
+| `REDIS_MAXMEMORY` | Memory cap for the Redis carrying the Celery broker and the app cache (default: `2gb`) |
+| `REDIS_CALL_PROCESSING_MAXMEMORY` | Memory cap for `redis-call-processing`, a cache only (default: `512mb`) |
+| `REDIS_MAXMEMORY_CLIENTS` | Cap on client output buffers (default: `5%`) |
+
+The eviction policy is pinned to `noeviction` and is deliberately not
+configurable: anything else lets Redis silently delete queued Celery tasks or
+the keys that back rate limits and distributed locks.
+
+**Celery backpressure** (the enqueue path refuses work above a queue depth):
+
+| Variable | Description |
+|----------|-------------|
+| `CELERY_MAX_QUEUE_DEPTH` | Queued tasks above which inference requests get a 429 (default: `10000`; `0` disables) |
+| `CELERY_QUEUE_DEPTH_CACHE_TTL_SECONDS` | How long a measured queue depth is reused (default: `1.0`) |
+| `CELERY_BACKPRESSURE_RETRY_AFTER_SECONDS` | `Retry-After` on the 429 (default: `30`) |
 
 **Application Settings**:
 
@@ -607,6 +622,24 @@ docker-compose exec redis-call-processing redis-cli
 
 - Ensure Redis is running: `docker-compose ps redis-floware`
 - Test connection: `docker-compose exec redis-floware redis-cli ping`
+- Check the memory limits: `docker-compose exec redis-floware redis-cli config get maxmemory maxmemory-policy`
+- Check headroom: `docker-compose exec redis-floware redis-cli info memory | grep -E 'used_memory_human|maxmemory_human'`
+
+If writes are failing with `OOM command not allowed`, Redis is at its
+`maxmemory` and refusing writes by design — reads still work. Raise
+`REDIS_MAXMEMORY`, or find what filled it with `redis-cli --bigkeys`.
+
+### Celery Queue Issues
+
+- Queue depth: `docker-compose exec redis-floware redis-cli llen '{celery}'`
+- **Mind the quoting.** The queue key is literally `{celery}` (the braces are a
+  Redis Cluster hash tag, not a placeholder). `llen celery` reads a key that
+  does not exist and answers `0`.
+- All broker keys: `docker-compose exec redis-floware redis-cli --scan --pattern '{celery}*'`
+
+Inference endpoints returning `429` with a `Retry-After` header means the queue
+is at `CELERY_MAX_QUEUE_DEPTH` and the workers are not draining fast enough —
+scale the workers, or raise the limit if Redis has headroom.
 
 ### Port Conflicts
 

@@ -3,6 +3,7 @@ from dependency_injector import containers, providers
 from triggers_module.services.trigger_crud_service import TriggerCrudService
 from triggers_module.services.trigger_event_processor import TriggerEventProcessor
 from agents_module.utils.celery_client import build_celery_client
+from agents_module.utils.celery_settings import CeleryProducerSettings
 from triggers_module.services.trigger_push_receiver import TriggerPushReceiver
 from triggers_module.services.trigger_subscription_renewer import (
     TriggerSubscriptionRenewer,
@@ -24,8 +25,23 @@ class TriggersContainer(containers.DeclarativeContainer):
 
     async_agentic_execution_service = providers.Dependency()
     cache_manager = providers.Dependency()
+    # The [celery] section of config.ini. A key the ini does not define (the
+    # celery worker's has only the socket timeout) arrives as None and takes
+    # the default.
+    celery_settings = providers.Singleton(
+        CeleryProducerSettings,
+        max_queue_depth=config.celery.max_queue_depth,
+        queue_depth_cache_ttl_seconds=config.celery.queue_depth_cache_ttl_seconds,
+        queue_depth_warn_ratio=config.celery.queue_depth_warn_ratio,
+        backpressure_retry_after_seconds=(
+            config.celery.backpressure_retry_after_seconds
+        ),
+        broker_socket_timeout_seconds=config.celery.broker_socket_timeout_seconds,
+    )
     celery_client = providers.Singleton(
-        build_celery_client, broker_url=config.celery.broker_url
+        build_celery_client,
+        broker_url=config.celery.broker_url,
+        settings=celery_settings,
     )
 
     gmail_watch_config = providers.Singleton(
@@ -50,6 +66,7 @@ class TriggersContainer(containers.DeclarativeContainer):
         trigger_repository=trigger_repository,
         email_connection_service=email_connection_service,
         celery_client=celery_client,
+        celery_settings=celery_settings,
     )
 
     trigger_event_processor = providers.Singleton(

@@ -21,6 +21,12 @@ from agents_module.models.async_agentic_execution_schemas import (
     AgenticExecutionStatusResponse,
 )
 from celery import Celery
+
+from agents_module.utils.celery_backpressure import (
+    ensure_queue_capacity,
+    queue_is_saturated,
+)
+from agents_module.utils.celery_settings import CeleryProducerSettings
 from agents_module.utils.execution_variable_utils import with_execution_variables
 from agents_module.utils.mime_type_utils import (
     SUPPORTED_DOCUMENT_MIME_TYPES,
@@ -188,12 +194,29 @@ class AsyncAgenticExecutionService:
         cache_manager: CacheManager,
         executions_bucket: str,
         celery_client: Celery,
+        celery_settings: CeleryProducerSettings | None = None,
     ):
         self.repo = async_agentic_execution_repository
         self.cloud_storage = cloud_storage_manager
         self.cache = cache_manager
         self.bucket = executions_bucket
         self.celery = celery_client
+        self.celery_settings = celery_settings or CeleryProducerSettings()
+
+    async def queue_is_saturated(self) -> bool:
+        """Whether the broker queue is at or over its limit right now.
+
+        For the controllers, which ask before doing anything with a side
+        effect so that a refusal leaves no row and no stored blob behind.
+        create_and_enqueue_* checks again and raises QueueBackpressure.
+        """
+        saturated, _depth = await queue_is_saturated(self.celery, self.celery_settings)
+        return saturated
+
+    @property
+    def backpressure_retry_after_seconds(self) -> int:
+        """`Retry-After` for a 429 answered on queue_is_saturated()."""
+        return self.celery_settings.backpressure_retry_after_seconds
 
     def pre_save_binary_inputs(
         self,
@@ -320,7 +343,20 @@ class AsyncAgenticExecutionService:
         app_key: Optional[str],
         llm_config: Optional[Dict] = None,
         version: Optional[int] = None,
+        enforce_queue_limit: bool = True,
     ) -> AsyncInferenceResponse:
+        # Defence in depth: the controllers already refuse a saturated queue
+        # with a 429, this covers callers that are not an HTTP route. The
+        # measured depth is cached per process, so the second check inside the
+        # same window costs no extra round trip.
+        #
+        # enforce_queue_limit=False is for callers running *inside* the worker,
+        # where the work has already been admitted and a refusal here would
+        # destroy it rather than defer it. See _dispatch_inference in
+        # triggers_module/services/trigger_event_processor.py.
+        if enforce_queue_limit:
+            await ensure_queue_capacity(self.celery, self.celery_settings)
+
         execution_id = uuid.uuid4()
         prefix = f'executions/agents/{agent_id}/{execution_id}/'
 
@@ -355,7 +391,13 @@ class AsyncAgenticExecutionService:
         }
 
         try:
-            result = self.celery.send_task(
+            # send_task is synchronous redis-py, like pre_save_binary_inputs
+            # above and every cache call below, so it belongs off the loop for
+            # the same reason: inline, a slow broker stalls the whole worker —
+            # every unrelated in-flight request with it — for up to
+            # broker_socket_timeout_seconds per publish.
+            result = await asyncio.to_thread(
+                self.celery.send_task,
                 _AGENT_TASK_NAME,
                 kwargs={'payload': payload},
             )
@@ -391,7 +433,12 @@ class AsyncAgenticExecutionService:
         access_token: Optional[str],
         app_key: Optional[str],
         version: Optional[int] = None,
+        enforce_queue_limit: bool = True,
     ) -> AsyncInferenceResponse:
+        # See create_and_enqueue_agent for why this is here and when it is off.
+        if enforce_queue_limit:
+            await ensure_queue_capacity(self.celery, self.celery_settings)
+
         execution_id = uuid.uuid4()
         prefix = f'executions/workflows/{workflow_id}/{execution_id}/'
 
@@ -428,7 +475,9 @@ class AsyncAgenticExecutionService:
         }
 
         try:
-            result = self.celery.send_task(
+            # Off the loop, as in create_and_enqueue_agent above.
+            result = await asyncio.to_thread(
+                self.celery.send_task,
                 _WORKFLOW_TASK_NAME,
                 kwargs={'payload': payload},
             )
