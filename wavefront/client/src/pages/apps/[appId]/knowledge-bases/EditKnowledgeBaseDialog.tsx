@@ -1,5 +1,5 @@
 import floConsoleService from '@app/api';
-import { KbData, UpdateKnowledgeBasePayload } from '@app/api/knowledge-base-service';
+import { KbData, KNOWLEDGE_BASE_TYPES, UpdateKnowledgeBasePayload } from '@app/api/knowledge-base-service';
 import { Button } from '@app/components/ui/button';
 import {
   Dialog,
@@ -9,15 +9,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@app/components/ui/dialog';
-import {
-  Form,
-  FormControl,
-  FormDescription,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from '@app/components/ui/form';
+import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from '@app/components/ui/form';
 import { Input } from '@app/components/ui/input';
 import { extractErrorMessage } from '@app/lib/utils';
 import { useNotifyStore } from '@app/store';
@@ -28,7 +20,6 @@ import { z } from 'zod';
 
 const editKnowledgeBaseSchema = z.object({
   name: z.string().min(1, 'Knowledge base name is required'),
-  type: z.string().min(1, 'Type is required'),
   description: z.string().optional(),
 });
 
@@ -53,7 +44,6 @@ const EditKnowledgeBaseDialog: React.FC<EditKnowledgeBaseDialogProps> = ({
     resolver: zodResolver(editKnowledgeBaseSchema),
     defaultValues: {
       name: '',
-      type: '',
       description: '',
     },
   });
@@ -62,7 +52,6 @@ const EditKnowledgeBaseDialog: React.FC<EditKnowledgeBaseDialogProps> = ({
     if (knowledgeBase && isOpen) {
       form.reset({
         name: knowledgeBase.name || '',
-        type: knowledgeBase.type || '',
         description: knowledgeBase.description || '',
       });
     }
@@ -73,7 +62,6 @@ const EditKnowledgeBaseDialog: React.FC<EditKnowledgeBaseDialogProps> = ({
       const payload: UpdateKnowledgeBasePayload = {
         name: data.name.trim(),
         description: data.description?.trim() || '',
-        type: data.type.trim(),
       };
 
       await floConsoleService.knowledgeBaseService.updateKnowledgeBase(knowledgeBase.id, payload);
@@ -90,7 +78,7 @@ const EditKnowledgeBaseDialog: React.FC<EditKnowledgeBaseDialogProps> = ({
 
   return (
     <Dialog open={isOpen} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[90vh] max-w-4xl overflow-y-auto lg:max-w-4xl">
+      <DialogContent className="max-h-[90vh] max-w-4xl min-w-0 overflow-y-auto lg:max-w-4xl">
         <DialogHeader>
           <DialogTitle>Edit Knowledge Base</DialogTitle>
           <DialogDescription>Update the details for this knowledge base</DialogDescription>
@@ -110,28 +98,23 @@ const EditKnowledgeBaseDialog: React.FC<EditKnowledgeBaseDialogProps> = ({
                     <FormControl>
                       <Input placeholder="e.g., Customer Support FAQ" {...field} />
                     </FormControl>
-                    <FormDescription>A unique name for your knowledge base</FormDescription>
                     <FormMessage />
                   </FormItem>
                 )}
               />
 
-              <FormField
-                control={form.control}
-                name="type"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>
-                      Type<span className="text-red-500">*</span>
-                    </FormLabel>
-                    <FormControl>
-                      <Input placeholder="e.g., General" {...field} />
-                    </FormControl>
-                    <FormDescription>The type of your knowledge base</FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
+              {/* The type decides the embedding models, so it is fixed at creation */}
+              <FormItem>
+                <FormLabel>Type</FormLabel>
+                <Input
+                  disabled
+                  value={
+                    KNOWLEDGE_BASE_TYPES.find((t) => t.value === knowledgeBase?.type)?.label ??
+                    knowledgeBase?.type ??
+                    ''
+                  }
+                />
+              </FormItem>
             </div>
 
             <FormField
@@ -148,7 +131,6 @@ const EditKnowledgeBaseDialog: React.FC<EditKnowledgeBaseDialogProps> = ({
                       {...field}
                     />
                   </FormControl>
-                  <FormDescription>Provide a description for your knowledge base</FormDescription>
                   <FormMessage />
                 </FormItem>
               )}

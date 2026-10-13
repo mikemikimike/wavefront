@@ -8,17 +8,19 @@ import AuthenticatorDetailPage from '@app/pages/apps/[appId]/authenticators/[aut
 import ChatbotsPage from '@app/pages/apps/[appId]/chatbots';
 import DatasourcesManagement from '@app/pages/apps/[appId]/datasources';
 import DatasourceDetail from '@app/pages/apps/[appId]/datasources/[datasourceId]';
+import EmailConnectionsPage from '@app/pages/apps/[appId]/email-connections';
+import OAuthAppsPage from '@app/pages/apps/[appId]/oauth-apps';
 import ScheduledJobsPage from '@app/pages/apps/[appId]/scheduled-jobs';
+// import TriggersPage from '@app/pages/apps/[appId]/triggers';
 import ConfigurationsManagement from '@app/pages/apps/[appId]/configurations';
 import ConfigurationDetail from '@app/pages/apps/[appId]/configurations/[configKey]';
 import FunctionsManagement from '@app/pages/apps/[appId]/functions';
 import FunctionDetail from '@app/pages/apps/[appId]/functions/[functionId]';
 import KnowledgeBaseDetailPage from '@app/pages/apps/[appId]/knowledge-bases/[kbId]';
 import KnowledgeBasesListPage from '@app/pages/apps/[appId]/knowledge-bases/index';
+import GuardrailsManagement from '@app/pages/apps/[appId]/guardrails';
 import LLMInferenceConfigsManagement from '@app/pages/apps/[appId]/llm-inference';
 import LLMInferenceConfigDetail from '@app/pages/apps/[appId]/llm-inference/[configId]';
-import ModelManagement from '@app/pages/apps/[appId]/model-inference';
-import ModelDetail from '@app/pages/apps/[appId]/model-inference/[modelId]';
 import VoiceAgentsPage from '@app/pages/apps/[appId]/voice-agents';
 import VoiceAgentsLayout from '@app/pages/apps/[appId]/voice-agents/layout';
 import SttConfigsPage from '@app/pages/apps/[appId]/voice-agents/stt-configs';
@@ -28,8 +30,6 @@ import TtsConfigsPage from '@app/pages/apps/[appId]/voice-agents/tts-configs';
 import WorkflowManagement from '@app/pages/apps/[appId]/workflows';
 import WorkflowDetail from '@app/pages/apps/[appId]/workflows/[id]';
 import WorkflowsLayout from '@app/pages/apps/[appId]/workflows/layout';
-import WorkflowPipelinesPage from '@app/pages/apps/[appId]/workflows/pipelines';
-import WorkflowPipelineDetail from '@app/pages/apps/[appId]/workflows/pipelines/[workflowPipelineId]';
 import UsersPage from '@app/pages/apps/users';
 import CreateApp from '@app/pages/apps/create';
 import EditApp from '@app/pages/apps/edit/[appId]';
@@ -39,9 +39,6 @@ import Login from '@app/pages/login';
 import Logout from '@app/pages/logout';
 import ResetPassword from '@app/pages/reset-password';
 import { Navigate } from 'react-router';
-// import PipelineManagement from '@app/pages/pipelines';
-// import PipelineDetail from '@app/pages/pipelines/[pipelineId]';
-// import CreatePipeline from '@app/pages/pipelines/create';
 
 const routes = {
   public: [
@@ -104,16 +101,20 @@ const routes = {
           element: <DatasourceDetail />,
         },
         {
+          path: 'email-connections',
+          element: <EmailConnectionsPage />,
+        },
+        {
+          path: 'oauth-apps',
+          element: <OAuthAppsPage />,
+        },
+        // {
+        //   path: 'triggers',
+        //   element: <TriggersPage />,
+        // },
+        {
           path: 'scheduled-jobs',
           element: <ScheduledJobsPage />,
-        },
-        {
-          path: 'model-inference',
-          element: <ModelManagement />,
-        },
-        {
-          path: 'model-inference/:modelId',
-          element: <ModelDetail />,
         },
         {
           path: 'knowledge-bases',
@@ -132,6 +133,10 @@ const routes = {
           element: <LLMInferenceConfigDetail />,
         },
         {
+          path: 'guardrails',
+          element: <GuardrailsManagement />,
+        },
+        {
           path: 'workflows',
           element: <WorkflowsLayout />,
           children: [
@@ -140,18 +145,10 @@ const routes = {
               element: <WorkflowManagement />,
             },
             {
-              path: 'pipelines',
-              element: <WorkflowPipelinesPage />,
-            },
-            {
               path: ':id',
               element: <WorkflowDetail />,
             },
           ],
-        },
-        {
-          path: 'workflows/pipelines/:workflowPipelineId',
-          element: <WorkflowPipelineDetail />,
         },
         {
           path: 'chatbots',
@@ -173,18 +170,6 @@ const routes = {
           path: 'functions/:functionId',
           element: <FunctionDetail />,
         },
-        // {
-        //   path: 'data-pipelines',
-        //   element: <PipelineManagement />,
-        // },
-        // {
-        //   path: 'data-pipelines/create',
-        //   element: <CreatePipeline />,
-        // },
-        // {
-        //   path: 'data-pipelines/:pipelineId',
-        //   element: <PipelineDetail />,
-        // },
         {
           path: 'voice-agents',
           element: <VoiceAgentsLayout />,

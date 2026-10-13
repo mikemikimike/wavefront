@@ -1,33 +1,12 @@
 from uuid import uuid4
 from db_repo_module.models.knowledge_bases import KnowledgeBase
-from db_repo_module.models.session import Session
-from db_repo_module.models.user import User
 from db_repo_module.models.knowledge_base_documents import KnowledgeBaseDocuments
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import status, UploadFile
 from starlette.datastructures import Headers
 from io import BytesIO
-
-
-async def create_session(test_session: AsyncSession, test_user_id, test_session_id):
-    user = User(
-        id=test_user_id,
-        email='test@example.com',
-        password='hashed_password',
-        first_name='Test',
-        last_name='User',
-    )
-
-    # Create a session in the database
-    db_session = Session(
-        id=test_session_id, user_id=test_user_id, device_info='test_device'
-    )
-
-    async with test_session() as session:
-        session.add(user)
-        session.add(db_session)
-        await session.commit()
+from flo_testing import seed_user_session as create_session
 
 
 @pytest.mark.asyncio
@@ -43,7 +22,7 @@ async def test_upload_document_success(
             id=kb_id,
             name='Test KB',
             description='Test Description',
-            type='document',
+            type='text',
             vector_size=1536,
         )
         session.add(new_kb)
@@ -113,7 +92,7 @@ async def test_upload_document_kb_id_not_exists(
             id=kb_id,
             name='Test KB',
             description='Test Description',
-            type='document',
+            type='text',
             vector_size=1536,
         )
         session.add(new_kb)
@@ -173,7 +152,7 @@ async def test_get_documents_success(
             id=kb_id,
             name='Test KB for Get',
             description='Test Description',
-            type='document',
+            type='text',
             vector_size=1536,
         )
         session.add(new_kb)
@@ -222,8 +201,8 @@ async def test_get_documents_success(
     assert get_response.status_code == status.HTTP_200_OK
     response_data = get_response.json()
     assert len(response_data['data']['resources']) == 2
-    assert response_data['data']['resources'][0]['file_name'] == 'doc1.txt'
-    assert response_data['data']['resources'][1]['file_name'] == 'doc2.pdf'
+    file_names = {doc['file_name'] for doc in response_data['data']['resources']}
+    assert file_names == {'doc1.txt', 'doc2.pdf'}
 
 
 @pytest.mark.asyncio
@@ -239,7 +218,7 @@ async def test_get_documents_filter_by_type(
             id=kb_id,
             name='Test KB Filter',
             description='Test Description',
-            type='document',
+            type='text',
             vector_size=1536,
         )
         session.add(new_kb)
@@ -280,8 +259,8 @@ async def test_get_documents_filter_by_type(
     assert get_response.status_code == status.HTTP_200_OK
     response_data = get_response.json()
     assert len(response_data['data']['resources']) == 2
-    assert response_data['data']['resources'][0]['file_name'] == 'file1.txt'
-    assert response_data['data']['resources'][1]['file_name'] == 'file3.txt'
+    file_names = {doc['file_name'] for doc in response_data['data']['resources']}
+    assert file_names == {'file1.txt', 'file3.txt'}
 
 
 @pytest.mark.asyncio
@@ -297,7 +276,7 @@ async def test_get_documents_no_documents_found(
             id=kb_id,
             name='Test KB No Docs',
             description='Test Description',
-            type='document',
+            type='text',
             vector_size=1536,
         )
         session.add(new_kb)
@@ -327,7 +306,7 @@ async def test_delete_document_success(
             id=kb_id,
             name='Test KB for Delete',
             description='Test Description',
-            type='document',
+            type='text',
             vector_size=1536,
         )
         session.add(new_kb)
@@ -383,7 +362,7 @@ async def test_delete_document_not_found(
             id=kb_id,
             name='Test KB for Delete Non Existent',
             description='Test Description',
-            type='document',
+            type='text',
             vector_size=1536,
         )
         session.add(new_kb)

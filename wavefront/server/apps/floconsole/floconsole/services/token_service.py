@@ -7,7 +7,7 @@ from datetime import datetime
 from datetime import timedelta
 from enum import Enum
 from typing import Any
-from flo_cloud._types import FloKMS
+from flo_cloud._types import FloSigner
 
 
 class TokenAlgorithms(str, Enum):
@@ -25,32 +25,23 @@ class TokenAlgorithms(str, Enum):
 class TokenService:
     def __init__(
         self,
-        private_key: str,
-        public_key: str,
-        kms_service: FloKMS | None,
+        kms_signer: FloSigner,
+        *,
+        token_expiry: int,
+        temporary_token_expiry: int,
+        app_env: str,
+        token_prefix: str,
+        issuer: str,
+        audience: str,
         algorithm: TokenAlgorithms = TokenAlgorithms.PS256,
-        token_expiry: int = 4 * 60 * 60,  # 4 hours in seconds
-        temporary_token_expiry: int = 10 * 60,  # 10 minutes in seconds
-        app_env: str = 'production',
-        token_prefix: str = 'fc_',
-        issuer: str = 'https://console.rootflo.ai',
-        audience: str = 'https://console.rootflo.ai',
     ):
-        self.is_dev = app_env == 'dev' or (kms_service is None)
-        self.private_key = self._load_key(private_key) if self.is_dev else None
-        self.public_key = self._load_key(public_key) if self.is_dev else None
-        self.algorithm = TokenAlgorithms.RS256.value if self.is_dev else algorithm.value
+        self.algorithm = algorithm.value
         self.token_expiry = int(token_expiry)
         self.temporary_token_expiry = int(temporary_token_expiry)
-        self.kms_service = kms_service
-        self.token_prefix = token_prefix or 'fc_'
+        self.kms_signer = kms_signer
+        self.token_prefix = token_prefix
         self.issuer = issuer
         self.audience = audience
-
-    def _load_key(self, key: str):
-        if not key:
-            return None
-        return base64.b64decode(key).decode('ascii')
 
     def create_token(
         self,
@@ -86,26 +77,19 @@ class TokenService:
         if payload:
             data.update(payload)
 
-        if self.is_dev:
-            token = jwt.encode({**data}, self.private_key, algorithm=self.algorithm)
-            return f'{self.token_prefix}{token}'
-        else:
-            header = {'alg': self.algorithm, 'typ': 'JWT'}
+        header = {'alg': self.algorithm, 'typ': 'JWT'}
 
-            header_b64 = self._base64url_encode(json.dumps(header).encode())
-            payload_b64 = self._base64url_encode(json.dumps(data).encode())
-            message = f'{header_b64}.{payload_b64}'
+        header_b64 = self._base64url_encode(json.dumps(header).encode())
+        payload_b64 = self._base64url_encode(json.dumps(data).encode())
+        message = f'{header_b64}.{payload_b64}'
 
-            digest = hashlib.sha256(message.encode()).digest()
+        digest = hashlib.sha256(message.encode()).digest()
 
-            if self.kms_service is None:
-                raise ValueError('KMS service is not initialized')
+        signature = self.kms_signer.sign(message=digest)
+        signature = self._base64url_encode(signature)
 
-            signature = self.kms_service.sign(message=digest)
-            signature = self._base64url_encode(signature)
-
-            token = f'{message}.{signature}'
-            return f'{self.token_prefix}{token}'
+        token = f'{message}.{signature}'
+        return f'{self.token_prefix}{token}'
 
     def decode_token(self, token: str) -> dict:
         # Validate and remove prefix
@@ -116,40 +100,26 @@ class TokenService:
 
         # Remove the prefix
         clean_token = token[len(self.token_prefix) :]
+        header_b64, payload_b64, signature_b64 = clean_token.split('.')
 
-        if self.is_dev:
-            decoded = jwt.decode(
-                clean_token,
-                self.public_key,
-                algorithms=[self.algorithm],
-                issuer=self.issuer,
-                audience=self.audience,
-            )
-            return decoded
-        else:
-            header_b64, payload_b64, signature_b64 = clean_token.split('.')
+        message = f'{header_b64}.{payload_b64}'
+        digest = hashlib.sha256(message.encode()).digest()
+        signature = self._base64url_decode(signature_b64)
 
-            message = f'{header_b64}.{payload_b64}'
-            digest = hashlib.sha256(message.encode()).digest()
-            signature = self._base64url_decode(signature_b64)
+        is_valid = self.kms_signer.verify(message=digest, signature=signature)
+        if not is_valid:
+            return {}
 
-            if self.kms_service is None:
-                raise ValueError('KMS service is not initialized')
+        public_key_pem = self.kms_signer.get_public_key_pem()
 
-            is_valid = self.kms_service.verify(message=digest, signature=signature)
-            if not is_valid:
-                return {}
-
-            public_key_pem = self.kms_service.get_public_key_pem()
-
-            decoded = jwt.decode(
-                clean_token,
-                public_key_pem,
-                algorithms=[self.algorithm],
-                issuer=self.issuer,
-                audience=self.audience,
-            )
-            return decoded
+        decoded = jwt.decode(
+            clean_token,
+            public_key_pem,
+            algorithms=[self.algorithm],
+            issuer=self.issuer,
+            audience=self.audience,
+        )
+        return decoded
 
     def _base64url_encode(self, data: bytes) -> str:
         return base64.urlsafe_b64encode(data).rstrip(b'=').decode('utf-8')

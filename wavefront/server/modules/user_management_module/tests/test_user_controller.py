@@ -1,5 +1,7 @@
+import copy
 import uuid
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
 from db_repo_module.models.resource import Resource
 from db_repo_module.models.resource import ResourceScope
@@ -8,30 +10,14 @@ from db_repo_module.models.role_resource import RoleResource
 from db_repo_module.models.session import Session
 from db_repo_module.models.user import User
 from db_repo_module.models.user_role import UserRole
+import jwt
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from user_management_module.utils.user_utils import get_session_cache_key
-
-
-async def create_session(test_session: AsyncSession, test_user_id, test_session_id):
-    user = User(
-        id=test_user_id,
-        email='test@example.com',
-        password='hashed_password',
-        first_name='Test',
-        last_name='User',
-    )
-
-    # Create a session in the database
-    db_session = Session(
-        id=test_session_id, user_id=test_user_id, device_info='test_device'
-    )
-
-    async with test_session() as session:
-        session.add(user)
-        session.add(db_session)
-        await session.commit()
+from user_management_module.constants.cache import get_session_cache_key
+from user_management_module.constants.cache import password_reset_latest_key
+from flo_testing import seed_user_session as create_session
+from flo_testing.containers import DEFAULT_CONFIG
 
 
 async def setup_role_with_console_resource(test_session: AsyncSession, role_id: str):
@@ -73,6 +59,7 @@ async def test_create_user_success(
     new_user_data = {
         'email': 'test2@example.com',
         'password': 'Test@123',  # Updated password with special character
+        'confirm_password': 'Test@123',
         'first_name': 'Test',
         'last_name': 'User',
         'role_id': ['test_role_id'],
@@ -94,6 +81,36 @@ async def test_create_user_success(
 
 
 @pytest.mark.asyncio
+async def test_create_user_mismatched_confirmation(
+    test_client,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    await create_session(test_session, test_user_id, test_session_id)
+    await setup_role_with_console_resource(test_session, 'test_role_id')
+
+    new_user_data = {
+        'email': 'mismatch@example.com',
+        'password': 'Test@123',
+        'confirm_password': 'Different@123',
+        'first_name': 'Test',
+        'last_name': 'User',
+        'role_id': ['test_role_id'],
+    }
+
+    response = test_client.post(
+        '/floware/v1/users',
+        json=new_user_data,
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 422
+    assert 'do not match' in str(response.json()).lower()
+
+
+@pytest.mark.asyncio
 async def test_send_reset_password_email_soft_deleted_user(
     test_client,
     setup_containers,
@@ -110,8 +127,8 @@ async def test_send_reset_password_email_soft_deleted_user(
     here would turn the endpoint into an account enumeration oracle.
     """
     _, _, user_container = setup_containers
-    email_service = user_container.email_service()
-    email_service.send_forget_password_email.reset_mock()
+    email_service = user_container.email_send_service()
+    email_service.send.reset_mock()
 
     # Create test user and session
     await create_session(test_session, test_user_id, test_session_id)
@@ -129,12 +146,13 @@ async def test_send_reset_password_email_soft_deleted_user(
         await session.commit()
 
     response = test_client.post(
-        '/floware/v1/user/send-reset-password-email?email=deleted_reset@example.com',
+        '/floware/v1/user/send-reset-password-email',
+        json={'email': 'deleted_reset@example.com'},
         headers={'Authorization': f'Bearer {auth_token}'},
     )
     assert response.status_code == 200
     assert 'If an account exists' in response.json()['data']['message']
-    email_service.send_forget_password_email.assert_not_called()
+    email_service.send.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -149,18 +167,19 @@ async def test_send_reset_password_email_unknown_email(
 ):
     """An address with no account behind it is answered exactly like one that has."""
     _, _, user_container = setup_containers
-    email_service = user_container.email_service()
-    email_service.send_forget_password_email.reset_mock()
+    email_service = user_container.email_send_service()
+    email_service.send.reset_mock()
 
     await create_session(test_session, test_user_id, test_session_id)
 
     response = test_client.post(
-        '/floware/v1/user/send-reset-password-email?email=nobody@example.com',
+        '/floware/v1/user/send-reset-password-email',
+        json={'email': 'nobody@example.com'},
         headers={'Authorization': f'Bearer {auth_token}'},
     )
     assert response.status_code == 200
     assert 'If an account exists' in response.json()['data']['message']
-    email_service.send_forget_password_email.assert_not_called()
+    email_service.send.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -180,8 +199,8 @@ async def test_send_reset_password_email_locked_user(
     exists to hide. The login endpoint is where a locked user learns about it.
     """
     _, _, user_container = setup_containers
-    email_service = user_container.email_service()
-    email_service.send_forget_password_email.reset_mock()
+    email_service = user_container.email_send_service()
+    email_service.send.reset_mock()
 
     await create_session(test_session, test_user_id, test_session_id)
 
@@ -198,13 +217,14 @@ async def test_send_reset_password_email_locked_user(
         await session.commit()
 
     response = test_client.post(
-        '/floware/v1/user/send-reset-password-email?email=locked_reset@example.com',
+        '/floware/v1/user/send-reset-password-email',
+        json={'email': 'locked_reset@example.com'},
         headers={'Authorization': f'Bearer {auth_token}'},
     )
     assert response.status_code == 200
     assert 'If an account exists' in response.json()['data']['message']
     assert 'locked' not in response.text.lower()
-    email_service.send_forget_password_email.assert_not_called()
+    email_service.send.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -231,6 +251,7 @@ async def test_create_user_duplicate_email(
     new_user_data = {
         'email': 'existing@example.com',
         'password': 'Test@123',
+        'confirm_password': 'Test@123',
         'first_name': 'Test',
         'last_name': 'User',
         'role_id': ['test_role_id'],
@@ -291,6 +312,75 @@ async def test_update_user_success(
         user_roles = user_roles.scalars().all()
         assert len(user_roles) == 1
         assert user_roles[0].role_id == 'new_role_id'
+
+
+@pytest.mark.asyncio
+async def test_update_user_password_requires_matching_confirmation(
+    test_client,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    await create_session(test_session, test_user_id, test_session_id)
+    async with test_session() as session:
+        user = User(
+            email='update_pw@example.com',
+            password='hashedpassword',
+            first_name='Test',
+            last_name='User',
+        )
+        session.add(user)
+        await session.flush()
+        user_id = str(user.id)
+        await session.commit()
+
+    response = test_client.patch(
+        '/floware/v1/users',
+        json={
+            'user_id': user_id,
+            'password': 'Test@123',
+            'confirm_password': 'Test@123',
+        },
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_update_user_password_mismatched_confirmation(
+    test_client,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    await create_session(test_session, test_user_id, test_session_id)
+    async with test_session() as session:
+        user = User(
+            email='update_pw_mismatch@example.com',
+            password='hashedpassword',
+            first_name='Test',
+            last_name='User',
+        )
+        session.add(user)
+        await session.flush()
+        user_id = str(user.id)
+        await session.commit()
+
+    response = test_client.patch(
+        '/floware/v1/users',
+        json={
+            'user_id': user_id,
+            'password': 'Test@123',
+            'confirm_password': 'Different@123',
+        },
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 422
+    assert 'do not match' in str(response.json()).lower()
 
 
 @pytest.mark.asyncio
@@ -588,6 +678,7 @@ async def test_create_user_reactivates_soft_deleted_user(
     new_user_data = {
         'email': 'softdeleted@example.com',  # Same email as soft-deleted user
         'password': 'NewPassword@123',
+        'confirm_password': 'NewPassword@123',
         'first_name': 'New',
         'last_name': 'Name',
         'role_id': ['test_role_id'],  # New role
@@ -661,6 +752,7 @@ async def test_create_user_reactivation_validates_roles(
     new_user_data = {
         'email': 'rolevalidation@example.com',
         'password': 'NewPassword@123',
+        'confirm_password': 'NewPassword@123',
         'first_name': 'New',
         'last_name': 'User',
         'role_id': ['nonexistent_role_id'],  # Invalid role
@@ -734,6 +826,7 @@ async def test_create_user_reactivation_requires_console_resource(
     new_user_data = {
         'email': 'noconsole@example.com',
         'password': 'NewPassword@123',
+        'confirm_password': 'NewPassword@123',
         'first_name': 'New',
         'last_name': 'User',
         'role_id': ['no_console_role'],
@@ -779,6 +872,7 @@ async def test_create_user_active_user_blocks_creation(
     new_user_data = {
         'email': 'active@example.com',
         'password': 'NewPassword@123',
+        'confirm_password': 'NewPassword@123',
         'first_name': 'New',
         'last_name': 'User',
         'role_id': ['test_role_id'],
@@ -1041,8 +1135,8 @@ async def test_send_reset_password_email(
     auth_token,
 ):
     _, _, user_container = setup_containers
-    email_service = user_container.email_service()
-    email_service.send_forget_password_email.reset_mock()
+    email_service = user_container.email_send_service()
+    email_service.send.reset_mock()
 
     # Create test user and session
     await create_session(test_session, test_user_id, test_session_id)
@@ -1059,14 +1153,15 @@ async def test_send_reset_password_email(
         await session.commit()
 
     response = test_client.post(
-        '/floware/v1/user/send-reset-password-email?email=reset@example.com',
+        '/floware/v1/user/send-reset-password-email',
+        json={'email': 'reset@example.com'},
         headers={'Authorization': f'Bearer {auth_token}'},
     )
     assert response.status_code == 200
     # Same message the unknown-email, deleted and locked cases return; the mail
     # itself is what separates a live account from those, not the reply.
     assert 'If an account exists' in response.json()['data']['message']
-    email_service.send_forget_password_email.assert_called_once()
+    email_service.send.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -1094,6 +1189,7 @@ async def test_reset_password(
     reset_data = {
         'secret_token': 'mock_token',  # Use the mock token that matches our mock setup
         'new_password': 'Test@123',  # Updated password with special character
+        'confirm_password': 'Test@123',
     }
 
     response = test_client.post(
@@ -1105,6 +1201,700 @@ async def test_reset_password(
     assert (
         'password has been updated successfully' in response.json()['data']['message']
     )
+
+
+@pytest.mark.asyncio
+async def test_reset_password_mismatched_confirmation(
+    test_client,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    await create_session(test_session, test_user_id, test_session_id)
+
+    reset_data = {
+        'secret_token': 'mock_token',
+        'new_password': 'Test@123',
+        'confirm_password': 'Different@123',
+    }
+
+    response = test_client.post(
+        '/floware/v1/user/reset-password',
+        json=reset_data,
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 422
+    assert 'do not match' in str(response.json()).lower()
+
+
+async def test_send_reset_password_email_cooldown_returns_429(
+    test_client,
+    setup_containers,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    _, common_container, user_container = setup_containers
+    email_sender = user_container.email_send_service()
+    email_sender.send.reset_mock()
+    common_container.cache_manager().add.return_value = False
+
+    await create_session(test_session, test_user_id, test_session_id)
+
+    response = test_client.post(
+        '/floware/v1/user/send-reset-password-email',
+        json={'email': 'reset@example.com'},
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 429
+    assert response.headers.get('retry-after') == '60'
+    email_sender.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_send_reset_password_email_hourly_cap_returns_429(
+    test_client,
+    setup_containers,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    _, common_container, user_container = setup_containers
+    email_sender = user_container.email_send_service()
+    email_sender.send.reset_mock()
+    cache = common_container.cache_manager()
+    cache.add.return_value = True
+    cache.incr_with_expiry.return_value = 4
+
+    await create_session(test_session, test_user_id, test_session_id)
+
+    response = test_client.post(
+        '/floware/v1/user/send-reset-password-email',
+        json={'email': 'reset@example.com'},
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 429
+    email_sender.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reset_password_rejects_replayed_token(
+    test_client,
+    setup_containers,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    _, common_container, _ = setup_containers
+    cache = common_container.cache_manager()
+    cache.pop_str.side_effect = [test_user_id, None]
+
+    await create_session(test_session, test_user_id, test_session_id)
+
+    reset_data = {
+        'secret_token': 'mock_token',
+        'new_password': 'Test@123',
+        'confirm_password': 'Test@123',
+    }
+    first = test_client.post(
+        '/floware/v1/user/reset-password',
+        json=reset_data,
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    second = test_client.post(
+        '/floware/v1/user/reset-password',
+        json=reset_data,
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert first.status_code == 200
+    assert second.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_reset_password_rejects_token_without_purpose(
+    test_client,
+    setup_containers,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    auth_container, _, _ = setup_containers
+    auth_container.token_service().decode_token.return_value = {
+        'code': 'mock_reset_code',
+    }
+    await create_session(test_session, test_user_id, test_session_id)
+
+    response = test_client.post(
+        '/floware/v1/user/reset-password',
+        json={
+            'secret_token': 'mock_token',
+            'new_password': 'Test@123',
+            'confirm_password': 'Test@123',
+        },
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_reset_password_rejects_malformed_token(
+    test_client,
+    setup_containers,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    auth_container, _, _ = setup_containers
+    auth_container.token_service().decode_token.side_effect = jwt.InvalidTokenError(
+        'bad token'
+    )
+    await create_session(test_session, test_user_id, test_session_id)
+
+    response = test_client.post(
+        '/floware/v1/user/reset-password',
+        json={
+            'secret_token': 'not-a-jwt',
+            'new_password': 'Test@123',
+            'confirm_password': 'Test@123',
+        },
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_reset_password_invalidates_sessions(
+    test_client,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    await create_session(test_session, test_user_id, test_session_id)
+
+    response = test_client.post(
+        '/floware/v1/user/reset-password',
+        json={
+            'secret_token': 'mock_token',
+            'new_password': 'Test@123',
+            'confirm_password': 'Test@123',
+        },
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 200
+
+    async with test_session() as session:
+        remaining = (
+            (
+                await session.execute(
+                    select(Session).where(Session.user_id == test_user_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert remaining == []
+
+
+RESET_BODY = {
+    'secret_token': 'mock_token',
+    'new_password': 'Test@123',
+    'confirm_password': 'Test@123',
+}
+
+
+async def _session_rows(test_session, user_id):
+    async with test_session() as session:
+        return (
+            (await session.execute(select(Session).where(Session.user_id == user_id)))
+            .scalars()
+            .all()
+        )
+
+
+def _config_with_cooldown(seconds: str):
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    config['auth']['password_reset_cooldown_seconds'] = seconds
+    return config
+
+
+@pytest.mark.asyncio
+async def test_reset_password_update_failure_keeps_sessions(
+    test_client,
+    setup_containers,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+    monkeypatch,
+):
+    _, _, user_container = setup_containers
+    await create_session(test_session, test_user_id, test_session_id)
+    monkeypatch.setattr(
+        user_container.user_repository(),
+        'find_one_and_update',
+        AsyncMock(return_value=None),
+    )
+
+    response = test_client.post(
+        '/floware/v1/user/reset-password',
+        json=RESET_BODY,
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+
+    assert response.status_code == 404
+    assert len(await _session_rows(test_session, test_user_id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_reset_password_succeeds_when_pointer_cleanup_fails(
+    test_client,
+    setup_containers,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    _, common_container, _ = setup_containers
+    await create_session(test_session, test_user_id, test_session_id)
+
+    def _remove(key):
+        if key.startswith('pwreset_latest_'):
+            raise RuntimeError('redis down')
+        return True
+
+    common_container.cache_manager().remove.side_effect = _remove
+
+    response = test_client.post(
+        '/floware/v1/user/reset-password',
+        json=RESET_BODY,
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+
+    assert response.status_code == 200
+    assert await _session_rows(test_session, test_user_id) == []
+
+
+@pytest.mark.asyncio
+async def test_reset_password_rejects_deleted_user(
+    test_client,
+    setup_containers,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    _, common_container, _ = setup_containers
+    await create_session(test_session, test_user_id, test_session_id)
+    async with test_session() as session:
+        user = User(
+            email='gone@example.com',
+            password='old_hash',
+            first_name='Gone',
+            last_name='User',
+            deleted=True,
+        )
+        session.add(user)
+        await session.flush()
+        deleted_id = str(user.id)
+        await session.commit()
+    common_container.cache_manager().pop_str.side_effect = (
+        lambda key, default=None: deleted_id if key == 'mock_reset_code' else default
+    )
+
+    response = test_client.post(
+        '/floware/v1/user/reset-password',
+        json=RESET_BODY,
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+
+    assert response.status_code == 404
+    async with test_session() as session:
+        stored = await session.scalar(select(User).where(User.id == deleted_id))
+    assert stored.password == 'old_hash'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'path, body',
+    [
+        ('/floware/v1/user/reset-password', RESET_BODY),
+        ('/floware/v1/user/send-reset-password-email', {'email': 'reset@example.com'}),
+    ],
+)
+async def test_password_reset_endpoints_enforce_recaptcha(
+    test_client,
+    setup_containers,
+    core_containers,
+    mock_auth_admin_user_functions,
+    path,
+    body,
+):
+    from dependency_injector import providers
+    from user_management_module.services.recaptcha_service import RecaptchaService
+
+    enabled = RecaptchaService(
+        enabled=True, project_id='p', site_key='s', score_threshold=0.5
+    )
+    core_containers.user.recaptcha_service.override(providers.Object(enabled))
+    try:
+        response = test_client.post(path, json=body)
+    finally:
+        core_containers.user.recaptcha_service.reset_override()
+
+    assert response.status_code == 403
+    core_containers.cache_manager.pop_str.assert_not_called()
+    core_containers.email_send_service.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_send_reset_password_email_supersedes_previous_link(
+    test_client,
+    setup_containers,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    _, common_container, _ = setup_containers
+    cache = common_container.cache_manager()
+    await create_session(test_session, test_user_id, test_session_id)
+    async with test_session() as session:
+        user = User(
+            email='reset@example.com',
+            password='hashedpassword',
+            first_name='Reset',
+            last_name='User',
+        )
+        session.add(user)
+        await session.flush()
+        user_id = str(user.id)
+        await session.commit()
+    pointer = password_reset_latest_key(user_id)
+    cache.pop_str.side_effect = (
+        lambda key, default=None: 'old_code' if key == pointer else default
+    )
+
+    response = test_client.post(
+        '/floware/v1/user/send-reset-password-email',
+        json={'email': 'reset@example.com'},
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+
+    assert response.status_code == 200
+    cache.remove.assert_any_call('old_code')
+    pointer_writes = [c for c in cache.add.call_args_list if c.args[:1] == (pointer,)]
+    assert len(pointer_writes) == 1
+    new_code = pointer_writes[0].args[1]
+    assert new_code != 'old_code'
+    cache.add.assert_any_call(new_code, user_id, expiry=600)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('user_config', [_config_with_cooldown('120')])
+async def test_send_reset_password_email_retry_after_follows_config(
+    test_client,
+    setup_containers,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+    user_config,
+):
+    _, common_container, _ = setup_containers
+    common_container.cache_manager().add.return_value = False
+    await create_session(test_session, test_user_id, test_session_id)
+
+    response = test_client.post(
+        '/floware/v1/user/send-reset-password-email',
+        json={'email': 'reset@example.com'},
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+
+    assert response.status_code == 429
+    assert response.headers.get('retry-after') == '120'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'password',
+    [
+        'test@123',  # no uppercase
+        'TEST@123',  # no lowercase
+        'Test1234',  # no special
+        'Te@1',  # too short
+    ],
+)
+async def test_create_user_rejects_weak_password(
+    test_client,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+    password,
+):
+    await create_session(test_session, test_user_id, test_session_id)
+    await setup_role_with_console_resource(test_session, 'test_role_id')
+
+    response = test_client.post(
+        '/floware/v1/users',
+        json={
+            'email': 'weak@example.com',
+            'password': password,
+            'confirm_password': password,
+            'first_name': 'Test',
+            'last_name': 'User',
+            'role_id': ['test_role_id'],
+        },
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_user_rejects_missing_confirm_password(
+    test_client,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    await create_session(test_session, test_user_id, test_session_id)
+    await setup_role_with_console_resource(test_session, 'test_role_id')
+
+    response = test_client.post(
+        '/floware/v1/users',
+        json={
+            'email': 'noconfirm@example.com',
+            'password': 'Test@123',
+            'first_name': 'Test',
+            'last_name': 'User',
+            'role_id': ['test_role_id'],
+        },
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_user_rejects_invalid_email_and_name(
+    test_client,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    await create_session(test_session, test_user_id, test_session_id)
+    await setup_role_with_console_resource(test_session, 'test_role_id')
+
+    response = test_client.post(
+        '/floware/v1/users',
+        json={
+            'email': 'not-an-email',
+            'password': 'Test@123',
+            'confirm_password': 'Test@123',
+            'first_name': 'Test123',
+            'last_name': 'User!',
+            'role_id': ['test_role_id'],
+        },
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_user_rejects_non_uuid_group_ids(
+    test_client,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    await create_session(test_session, test_user_id, test_session_id)
+    await setup_role_with_console_resource(test_session, 'test_role_id')
+
+    response = test_client.post(
+        '/floware/v1/users',
+        json={
+            'email': 'badgroup@example.com',
+            'password': 'Test@123',
+            'confirm_password': 'Test@123',
+            'first_name': 'Test',
+            'last_name': 'User',
+            'role_id': ['test_role_id'],
+            'group_ids': ['not-a-uuid'],
+        },
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_update_user_rejects_password_without_confirm(
+    test_client,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    await create_session(test_session, test_user_id, test_session_id)
+    async with test_session() as session:
+        user = User(
+            email='update_no_confirm@example.com',
+            password='hashedpassword',
+            first_name='Test',
+            last_name='User',
+        )
+        session.add(user)
+        await session.flush()
+        user_id = str(user.id)
+        await session.commit()
+
+    response = test_client.patch(
+        '/floware/v1/users',
+        json={'user_id': user_id, 'password': 'Test@123'},
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_update_user_rejects_invalid_user_id(
+    test_client,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    await create_session(test_session, test_user_id, test_session_id)
+
+    response = test_client.patch(
+        '/floware/v1/users',
+        json={'user_id': 'not-a-uuid', 'first_name': 'Test'},
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'password',
+    ['test@123', 'TEST@123', 'Test1234', 'Te@1'],
+)
+async def test_reset_password_rejects_weak_password(
+    test_client,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+    password,
+):
+    await create_session(test_session, test_user_id, test_session_id)
+
+    response = test_client.post(
+        '/floware/v1/user/reset-password',
+        json={
+            'secret_token': 'mock_token',
+            'new_password': password,
+            'confirm_password': password,
+        },
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_send_reset_password_email_rejects_invalid_email(
+    test_client,
+    setup_containers,
+    mock_auth_admin_user_functions,
+):
+    response = test_client.post(
+        '/floware/v1/user/send-reset-password-email',
+        json={'email': 'not-an-email'},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_delete_user_rejects_invalid_uuid(
+    test_client,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    await create_session(test_session, test_user_id, test_session_id)
+
+    response = test_client.delete(
+        '/floware/v1/users?id=not-a-uuid',
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 400
+    assert 'invalid user id' in response.json()['meta']['error'].lower()
+
+
+@pytest.mark.asyncio
+async def test_unblock_user_rejects_invalid_uuid(
+    test_client,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    await create_session(test_session, test_user_id, test_session_id)
+
+    response = test_client.patch(
+        '/floware/v1/users/not-a-uuid/unblock',
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 400
+    assert 'invalid user id' in response.json()['meta']['error'].lower()
+
+
+@pytest.mark.asyncio
+async def test_get_all_users_rejects_invalid_pagination(
+    test_client,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    await create_session(test_session, test_user_id, test_session_id)
+
+    response = test_client.get(
+        '/floware/v1/users?limit=0&offset=-1',
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -1162,6 +1952,7 @@ async def test_non_admin_user_create_user(
     new_user_data = {
         'email': 'test2@example.com',
         'password': 'Test@123',  # Updated password with special character
+        'confirm_password': 'Test@123',
         'first_name': 'Test',
         'last_name': 'User',
         'role_id': ['test_role_id'],
@@ -1188,6 +1979,7 @@ async def test_admin_user_create_user(
     new_user_data = {
         'email': 'test2@example.com',
         'password': 'Test@123',  # Updated password with special character
+        'confirm_password': 'Test@123',
         'first_name': 'Test',
         'last_name': 'User',
         'role_id': ['test_role_id', 'test_role_id2'],
@@ -1259,6 +2051,7 @@ async def test_admin_user_creat_non_admin_user(
     new_user_data = {
         'email': 'test2@example.com',
         'password': 'Test@123',  # Updated password with special character
+        'confirm_password': 'Test@123',
         'first_name': 'Test',
         'last_name': 'User',
         'role_id': ['test_role_id'],
@@ -1329,6 +2122,7 @@ async def test_admin_user_creat_non_admin_user_with_invalid_role(
     new_user_data = {
         'email': 'test2@example.com',
         'password': 'Test@123',  # Updated password with special character
+        'confirm_password': 'Test@123',
         'first_name': 'Test',
         'last_name': 'User',
         'role_id': ['123213123'],
@@ -1398,6 +2192,7 @@ async def test_admin_user_creat_non_admin_user_with_empty_role(
     new_user_data = {
         'email': 'test2@example.com',
         'password': 'Test@123',  # Updated password with special character
+        'confirm_password': 'Test@123',
         'first_name': 'Test',
         'last_name': 'User',
         'role_id': [],
@@ -1629,3 +2424,289 @@ async def test_get_user_by_id_includes_lockout_fields(
     assert user_data['last_failed_attempt'] is not None
     assert user_data['last_login_at'] is not None
     assert user_data['email'] == 'lockout_fields@example.com'
+
+
+@pytest.mark.asyncio
+async def test_delete_user_blocks_last_admin_self_delete(
+    test_client,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    await create_session(test_session, test_user_id, test_session_id)
+    async with test_session() as session:
+        role = Role(id='test_role_id', name='admin')
+        session.add(role)
+        await session.flush()
+        session.add(UserRole(user_id=test_user_id, role_id='test_role_id'))
+        await session.commit()
+
+    response = test_client.delete(
+        f'/floware/v1/users?id={test_user_id}',
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 400
+    assert 'admin is mandatory' in response.json()['meta']['error'].lower()
+
+
+@pytest.mark.asyncio
+async def test_reset_password_expired_token(
+    test_client,
+    core_containers,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    import jwt
+
+    await create_session(test_session, test_user_id, test_session_id)
+    original = core_containers.token_service.decode_token
+    core_containers.token_service.decode_token.side_effect = jwt.ExpiredSignatureError(
+        'expired'
+    )
+    try:
+        response = test_client.post(
+            '/floware/v1/user/reset-password',
+            json={
+                'secret_token': 'expired_token',
+                'new_password': 'Test@123',
+                'confirm_password': 'Test@123',
+            },
+            headers={'Authorization': f'Bearer {auth_token}'},
+        )
+        assert response.status_code == 404
+        assert (
+            "couldn't verify your identity" in response.json()['meta']['error'].lower()
+        )
+    finally:
+        core_containers.token_service.decode_token.side_effect = None
+        core_containers.token_service.decode_token.return_value = original.return_value
+
+
+@pytest.mark.asyncio
+async def test_reset_password_missing_cache_code(
+    test_client,
+    core_containers,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    await create_session(test_session, test_user_id, test_session_id)
+    original_get = core_containers.cache_manager.get_str.side_effect
+    original_decode = core_containers.token_service.decode_token.return_value
+    core_containers.token_service.decode_token.return_value = {'code': 'missing_code'}
+    core_containers.cache_manager.get_str.side_effect = lambda key: None
+    try:
+        response = test_client.post(
+            '/floware/v1/user/reset-password',
+            json={
+                'secret_token': 'token',
+                'new_password': 'Test@123',
+                'confirm_password': 'Test@123',
+            },
+            headers={'Authorization': f'Bearer {auth_token}'},
+        )
+        assert response.status_code == 404
+        err = response.json()['meta']['error'].lower()
+        assert 'expired' in err or 'verify' in err
+    finally:
+        core_containers.cache_manager.get_str.side_effect = original_get
+        core_containers.token_service.decode_token.return_value = original_decode
+
+
+@pytest.mark.asyncio
+async def test_get_user_by_id_invalid_uuid(
+    test_client,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    await create_session(test_session, test_user_id, test_session_id)
+    response = test_client.get(
+        '/floware/v1/users/not-a-uuid?force_fetch=1',
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_get_user_by_id_deleted_returns_404(
+    test_client,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    await create_session(test_session, test_user_id, test_session_id)
+    async with test_session() as session:
+        user = User(
+            email='deleted_get@example.com',
+            password='hashed',
+            first_name='Del',
+            last_name='User',
+            deleted=True,
+        )
+        session.add(user)
+        await session.flush()
+        deleted_id = str(user.id)
+        await session.commit()
+
+    response = test_client.get(
+        f'/floware/v1/users/{deleted_id}?force_fetch=1',
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_user_by_id_non_admin_denied_without_flag(
+    test_client,
+    mock_auth_non_admin_user_functions,
+    set_non_admin_data_access_flag,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    set_non_admin_data_access_flag(False)
+    await create_session(test_session, test_user_id, test_session_id)
+    response = test_client.get(
+        f'/floware/v1/users/{test_user_id}?force_fetch=1',
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_get_user_by_id_non_admin_allowed_with_flag(
+    test_client,
+    mock_auth_non_admin_user_functions,
+    patch_feature_flag,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    # get_user goes through can_read_users in user_utils, so patch both namespaces.
+    patch_feature_flag('user_management_module.controllers.user_controller', True)
+    patch_feature_flag('user_management_module.utils.user_utils', True)
+    await create_session(test_session, test_user_id, test_session_id)
+    response = test_client.get(
+        f'/floware/v1/users/{test_user_id}?force_fetch=1',
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 200
+    assert response.json()['data']['user']['id'] == test_user_id
+
+
+@pytest.mark.asyncio
+async def test_whoami_admin_payload_shape(
+    test_client,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    await create_session(test_session, test_user_id, test_session_id)
+    response = test_client.get(
+        '/floware/v1/whoami', headers={'Authorization': f'Bearer {auth_token}'}
+    )
+    assert response.status_code == 200
+    data = response.json()['data']
+    assert 'user' in data
+    assert 'resource' in data
+    assert set(data['resource'].keys()) >= {
+        'console_resources',
+        'dashboards',
+        'routes',
+        'data',
+    }
+    # Admin path leaves routes/data empty lists.
+    assert data['resource']['routes'] == []
+    assert data['resource']['data'] == []
+
+
+@pytest.mark.asyncio
+async def test_create_user_duplicate_username(
+    test_client,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+    auth_token,
+):
+    await create_session(test_session, test_user_id, test_session_id)
+    await setup_role_with_console_resource(test_session, 'test_role_id')
+    async with test_session() as session:
+        session.add(
+            User(
+                email='taken@example.com',
+                username='taken_user',
+                password='hashed',
+                first_name='Taken',
+                last_name='User',
+            )
+        )
+        await session.commit()
+
+    response = test_client.post(
+        '/floware/v1/users',
+        json={
+            'email': 'new@example.com',
+            'username': 'taken_user',
+            'password': 'Test@123',
+            'confirm_password': 'Test@123',
+            'first_name': 'New',
+            'last_name': 'User',
+            'role_id': ['test_role_id'],
+        },
+        headers={'Authorization': f'Bearer {auth_token}'},
+    )
+    assert response.status_code == 400
+    assert 'username' in response.json()['meta']['error'].lower()
+
+
+@pytest.mark.asyncio
+async def test_send_reset_password_email_generic_when_mail_fails(
+    test_client,
+    setup_containers,
+    core_containers,
+    mock_auth_admin_user_functions,
+    test_session,
+    test_user_id,
+    test_session_id,
+):
+    await create_session(test_session, test_user_id, test_session_id)
+    async with test_session() as session:
+        session.add(
+            User(
+                email='mailfail@example.com',
+                password='hashedpassword',
+                first_name='Mail',
+                last_name='Fail',
+            )
+        )
+        await session.commit()
+
+    original = core_containers.email_send_service.send
+    core_containers.email_send_service.send.side_effect = ValueError('smtp down')
+    try:
+        response = test_client.post(
+            '/floware/v1/user/send-reset-password-email',
+            json={'email': 'mailfail@example.com'},
+        )
+        assert response.status_code == 200
+        assert 'if an account exists' in response.json()['data']['message'].lower()
+    finally:
+        core_containers.email_send_service.send.side_effect = None
+        core_containers.email_send_service.send = original

@@ -1,5 +1,6 @@
 import floConsoleService from '@app/api';
 import ChatBot from '@app/components/ChatBot';
+import StreamToggle from '@app/components/StreamToggle';
 import DeleteConfirmationDialog from '@app/components/DeleteConfirmationDialog';
 import VersionsDialog from '@app/components/VersionsDialog';
 import {
@@ -13,10 +14,17 @@ import {
 import { Badge } from '@app/components/ui/badge';
 import { Button } from '@app/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@app/components/ui/select';
+import {
+  documentMimeTypeFor,
+  documentTypeFor,
+  validateDocumentUpload,
+  validateImageUpload,
+} from '@app/constants/upload';
 import { useDeleteAgent, usePromoteAgentVersion, useDeleteAgentVersion } from '@app/hooks';
 import { useGetAgent, useGetAgentVersions, useGetLLMConfigs, useGetTools } from '@app/hooks/data/fetch-hooks';
 import { getAgentKey, getAgentVersionsKey } from '@app/hooks/data/query-keys';
 import { useNotifyStore } from '@app/store';
+import { AgentStreamEvent } from '@app/types/agent';
 import { ChatMessage, ChatMessageContent } from '@app/types/chat-message';
 import { scrollToBottom } from '@app/utils/scroll';
 import { useQueryClient } from '@tanstack/react-query';
@@ -24,6 +32,7 @@ import yaml from 'js-yaml';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router';
 import EditAgentDialog from './EditAgentDialog';
+import { formatAppName } from '@app/lib/utils';
 
 const AgentDetail: React.FC = () => {
   const { app: appId, id } = useParams<{ app: string; id: string }>();
@@ -70,11 +79,18 @@ const AgentDetail: React.FC = () => {
       base64: string; // Full data URL for display
       base64Content: string; // Just base64 content for API
       mimeType: string;
-      documentType: 'pdf' | 'txt';
+      documentType: string;
     }>
   >([]);
   const [uploadingDocument, setUploadingDocument] = useState(false);
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
+
+  // Streaming state
+  const [listenEventsEnabled, setListenEventsEnabled] = useState(false);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [streamingEvents, setStreamingEvents] = useState<AgentStreamEvent[]>([]);
+  const eventsContainerRef = useRef<HTMLDivElement | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   // Datasource and tool selection state
   const [selectedTools, setSelectedTools] = useState<{ id: string; value: string }[]>([]);
@@ -206,19 +222,11 @@ const AgentDetail: React.FC = () => {
     const files = event.target.files;
     if (!files || files.length === 0) return;
 
-    // Validate file type
-    const allowedTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
-    const maxSize = 10 * 1024 * 1024; // 10MB
-
     // Validate all files before processing
     for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      if (!allowedTypes.includes(file.type)) {
-        notifyError(`File ${file.name} is not a valid image type. Please select JPEG, PNG, GIF, or WebP files.`);
-        return;
-      }
-      if (file.size > maxSize) {
-        notifyError(`File ${file.name} exceeds 10MB limit`);
+      const imageError = validateImageUpload(files[i]);
+      if (imageError) {
+        notifyError(imageError);
         return;
       }
     }
@@ -277,19 +285,11 @@ const AgentDetail: React.FC = () => {
     const files = event.target.files;
     if (!files || files.length === 0) return;
 
-    // Validate file type
-    const allowedTypes = ['application/pdf', 'text/plain'];
-    const maxSize = 50 * 1024 * 1024; // 50MB
-
     // Validate all files before processing
     for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      if (!allowedTypes.includes(file.type)) {
-        notifyError(`Invalid file type for ${file.name}. Please select PDF or TXT files only.`);
-        return;
-      }
-      if (file.size > maxSize) {
-        notifyError(`File ${file.name} is too large. Maximum size is 50MB.`);
+      const documentError = validateDocumentUpload(files[i]);
+      if (documentError) {
+        notifyError(documentError);
         return;
       }
     }
@@ -303,21 +303,20 @@ const AgentDetail: React.FC = () => {
         base64: string;
         base64Content: string;
         mimeType: string;
-        documentType: 'pdf' | 'txt';
+        documentType: string;
       }>((resolve, reject) => {
         const reader = new FileReader();
 
         reader.onload = (e) => {
           const dataUrl = e.target?.result as string;
           const base64 = dataUrl.split(',')[1];
-          const documentType = file.type === 'application/pdf' ? 'pdf' : 'txt';
 
           resolve({
             file,
             base64: dataUrl,
             base64Content: base64,
-            mimeType: file.type,
-            documentType,
+            mimeType: documentMimeTypeFor(file),
+            documentType: documentTypeFor(file),
           });
         };
 
@@ -505,18 +504,24 @@ const AgentDetail: React.FC = () => {
           },
         ];
       }
-      const result = await floConsoleService.agentService.runInference(
-        id,
-        inputs,
-        variables,
-        selectedLLMConfigId || undefined,
-        selectedTools.length > 0 ? selectedTools.map((tool) => tool.value) : undefined,
-        selectedVersion
-      );
-      const responseData = (result as { data?: { data?: { data?: { result?: string | object } } } }).data?.data?.data;
-      const agentResponse =
-        typeof responseData?.result === 'string' ? responseData.result : JSON.stringify(responseData?.result, null, 2);
-      setChatHistory((prev) => [...prev, { role: 'assistant', content: agentResponse }]);
+      if (listenEventsEnabled) {
+        await handleStreamingInference(inputs, variables);
+      } else {
+        const result = await floConsoleService.agentService.runInference(
+          id,
+          inputs,
+          variables,
+          selectedLLMConfigId || undefined,
+          selectedTools.length > 0 ? selectedTools.map((tool) => tool.value) : undefined,
+          selectedVersion
+        );
+        const responseData = (result as { data?: { data?: { data?: { result?: string | object } } } }).data?.data?.data;
+        const agentResponse =
+          typeof responseData?.result === 'string'
+            ? responseData.result
+            : JSON.stringify(responseData?.result, null, 2);
+        setChatHistory((prev) => [...prev, { role: 'assistant', content: agentResponse }]);
+      }
       // Wait for DOM to update before scrolling
       requestAnimationFrame(() => {
         setTimeout(() => scrollToBottom('message-container', 'smooth'), 150);
@@ -531,8 +536,116 @@ const AgentDetail: React.FC = () => {
     }
   };
 
+  /**
+   * Run the agent as an SSE stream.
+   *
+   * Deltas land in a placeholder assistant bubble as they arrive; the lifecycle
+   * and tool events go to the events panel. `output` overwrites the bubble
+   * rather than appending: an agent with tools produces no deltas at all - see
+   * the server's StreamingTapLLM - so for those the final event is the whole
+   * reply.
+   */
+  const handleStreamingInference = async (inputs: string | unknown[], variables: Record<string, unknown>) => {
+    if (!id) return;
+
+    abortControllerRef.current?.abort();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    setStreamingEvents([]);
+    setIsStreaming(true);
+
+    // The bubble the deltas accumulate into. Added up front so there is
+    // somewhere to put the first token without a re-render race.
+    setChatHistory((prev) => [...prev, { role: 'assistant', content: '' }]);
+
+    const replaceLastAssistantMessage = (update: (current: string) => string) => {
+      setChatHistory((prev) => {
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (!last || last.role !== 'assistant') return prev;
+        next[next.length - 1] = {
+          ...last,
+          content: update(typeof last.content === 'string' ? last.content : ''),
+        };
+        return next;
+      });
+    };
+
+    try {
+      await floConsoleService.agentService.streamInference(id, inputs, variables, {
+        llmInferenceConfigId: selectedLLMConfigId || undefined,
+        toolNames: selectedTools.length > 0 ? selectedTools.map((tool) => tool.value) : undefined,
+        version: selectedVersion,
+        signal: controller.signal,
+        onEvent: (event) => {
+          switch (event.event_type) {
+            case 'content_delta':
+              replaceLastAssistantMessage((current) => current + (event.content ?? ''));
+              break;
+
+            // A guardrail withdrew text already on screen. `content` is the
+            // whole of what may now be shown, not a delta, so it overwrites
+            // rather than appends. Recorded in the event list too: a silent
+            // rewrite of the bubble is indistinguishable from the model
+            // having said the corrected thing all along.
+            case 'retract':
+              replaceLastAssistantMessage(() => event.content ?? '');
+              setStreamingEvents((prev) => [...prev, event]);
+              break;
+
+            case 'output': {
+              const result =
+                typeof event.result === 'string' ? event.result : JSON.stringify(event.result ?? '', null, 2);
+              replaceLastAssistantMessage(() => result);
+              setStreamingEvents((prev) => [...prev, event]);
+              break;
+            }
+
+            case 'error':
+              notifyError(event.error || 'Agent inference failed');
+              setStreamingEvents((prev) => [...prev, event]);
+              break;
+
+            default:
+              setStreamingEvents((prev) => [...prev, event]);
+          }
+
+          const container = eventsContainerRef.current;
+          if (container) {
+            container.scrollTop = container.scrollHeight;
+          }
+        },
+      });
+    } catch (error) {
+      // An abort is the user starting another run or leaving the page, not a
+      // failure worth reporting.
+      if ((error as Error)?.name !== 'AbortError' && abortControllerRef.current === controller) {
+        notifyError(error instanceof Error ? error.message : 'Agent streaming failed');
+      }
+    } finally {
+      if (abortControllerRef.current === controller) {
+        setChatHistory((prev) => {
+          const last = prev[prev.length - 1];
+          if (last && last.role === 'assistant' && last.content === '') {
+            return prev.slice(0, -1);
+          }
+          return prev;
+        });
+        setIsStreaming(false);
+        abortControllerRef.current = null;
+      }
+    }
+  };
+
+  // Leaving the page mid-run should stop the run, not leave a stream reading
+  // into an unmounted component.
+  useEffect(() => {
+    return () => abortControllerRef.current?.abort();
+  }, []);
+
   return (
-    <div className="flex h-full flex-col bg-white p-8">
+    <div className="flex h-full flex-col bg-transparent p-8">
       <Breadcrumb className="mb-6">
         <BreadcrumbList>
           <BreadcrumbItem>
@@ -562,15 +675,16 @@ const AgentDetail: React.FC = () => {
       </Breadcrumb>
 
       {agentLoading ? (
-        <div className="flex items-center justify-center p-8">Loading agent...</div>
+        <div className="frost-text-muted flex items-center justify-center p-8">Loading agent...</div>
       ) : !agent ? (
-        <div className="flex items-center justify-center p-8 text-red-600">Agent not found</div>
+        <div className="flex items-center justify-center p-8 text-red-600 dark:text-red-400">Agent not found</div>
       ) : (
         <>
           <div className="flex w-full flex-1 flex-col gap-10">
             <div className="flex items-start justify-between">
-              <p className="text-2xl leading-normal font-semibold text-black">{agent.name}</p>
+              <p className="frost-text text-2xl leading-normal font-semibold">{formatAppName(agent.name)}</p>
               <div className="flex items-center gap-4">
+                <StreamToggle enabled={listenEventsEnabled} onChange={setListenEventsEnabled} subject="reply" />
                 {agentVersions.length > 0 && (
                   <Select
                     value={displayVersion !== undefined ? String(displayVersion) : ''}
@@ -631,6 +745,9 @@ const AgentDetail: React.FC = () => {
             handleDocumentUpload={handleDocumentUpload}
             uploadingImage={uploadingImage}
             uploadingDocument={uploadingDocument}
+            streamingEvents={streamingEvents}
+            isStreaming={isStreaming}
+            eventsContainerRef={eventsContainerRef}
           />
 
           {/* Edit Agent Dialog */}

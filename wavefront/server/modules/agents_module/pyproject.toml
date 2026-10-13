@@ -14,8 +14,10 @@ dependencies = [
     "tools-module",
     "api-services-module",
     "llm-inference-config-module",
-    "flo-ai==1.1.11",
+    "flo-ai==1.1.15",
     "celery[redis]>=5.4.0,<6.0.0",
+    "pillow>=11.0.0",
+    "pymupdf>=1.25.5,<2.0.0",
 ]
 
 [tool.uv.sources]
@@ -28,15 +30,16 @@ llm-inference-config-module = {workspace = true}
 
 [dependency-groups]
 dev = [
-    "pytest>=8.3.3,<9.0.0",
-    "pytest-asyncio>=0.24.0,<1.0.0",
+    "pytest>=9.0.3,<10.0.0",
+    "pytest-asyncio>=1.0.0,<2.0.0",
 ]
-
-[tool.pytest.ini_options]
-asyncio_mode = "auto"
 
 [tool.uv]
 package = true
+# Inert here: uv reads resolver settings only from the workspace root
+# (wavefront/server/pyproject.toml), which is where the real cooldown lives.
+# Kept so the setting survives if this package is ever split out.
+exclude-newer = "7 days"
 
 [build-system]
 requires = ["hatchling"]

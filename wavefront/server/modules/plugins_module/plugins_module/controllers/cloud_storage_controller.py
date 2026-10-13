@@ -39,8 +39,8 @@ async def get_resource_presigned_url(
         presigned_url = cloud_storage_manager.generate_presigned_url(
             bucket_name=bucket_name,
             key=key,
-            type='GET',
-            expiresIn=expires_in,
+            operation='GET',
+            expires_in=expires_in,
         )
         return JSONResponse(
             status_code=status.HTTP_200_OK,
@@ -95,7 +95,7 @@ async def read_storage_file(
         )
     except (json.JSONDecodeError, ValueError) as e:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content=response_formatter.buildErrorResponse(
                 f'Failed to parse file as {type.value}: {str(e)}'
             ),

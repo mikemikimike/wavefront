@@ -1,5 +1,6 @@
 import floConsoleService from '@app/api';
 import ChatBot from '@app/components/ChatBot';
+import StreamToggle from '@app/components/StreamToggle';
 import VersionsDialog from '@app/components/VersionsDialog';
 import { Badge } from '@app/components/ui/badge';
 import { Button } from '@app/components/ui/button';
@@ -8,6 +9,12 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Switch } from '@app/components/ui/switch';
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@app/components/ui/dialog';
 import { appEnv } from '@app/config/env';
+import {
+  documentMimeTypeFor,
+  documentTypeFor,
+  validateDocumentUpload,
+  validateImageUpload,
+} from '@app/constants/upload';
 import { useGetWorkflowVersions, usePromoteWorkflowVersion, useDeleteWorkflowVersion } from '@app/hooks';
 import { getWorkflowVersionsKey } from '@app/hooks/data/query-keys';
 import { useNotifyStore } from '@app/store';
@@ -21,6 +28,7 @@ import CodeMirror from '@uiw/react-codemirror';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 import { useParams } from 'react-router';
+import { formatAppName } from '@app/lib/utils';
 
 type MessageInput = { role: 'user' | 'assistant'; content: ChatMessageContent };
 
@@ -78,7 +86,7 @@ const WorkflowDetail: React.FC = () => {
       base64: string; // Full data URL for display
       base64Content: string; // Just base64 content for API
       mimeType: string;
-      documentType: 'pdf' | 'txt';
+      documentType: string;
     }>
   >([]);
   const [uploadingDocument, setUploadingDocument] = useState(false);
@@ -126,19 +134,11 @@ const WorkflowDetail: React.FC = () => {
       const files = event.target.files;
       if (!files || files.length === 0) return;
 
-      // Validate file type
-      const allowedTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
-      const maxSize = 10 * 1024 * 1024; // 10MB
-
       // Validate all files before processing
       for (let i = 0; i < files.length; i++) {
-        const file = files[i];
-        if (!allowedTypes.includes(file.type)) {
-          notifyError(`File ${file.name} is not a valid image type. Please select JPEG, PNG, GIF, or WebP files.`);
-          return;
-        }
-        if (file.size > maxSize) {
-          notifyError(`File ${file.name} exceeds 10MB limit`);
+        const imageError = validateImageUpload(files[i]);
+        if (imageError) {
+          notifyError(imageError);
           return;
         }
       }
@@ -225,19 +225,11 @@ const WorkflowDetail: React.FC = () => {
       const files = event.target.files;
       if (!files || files.length === 0) return;
 
-      // Validate file type
-      const allowedTypes = ['application/pdf', 'text/plain'];
-      const maxSize = 50 * 1024 * 1024; // 50MB
-
       // Validate all files before processing
       for (let i = 0; i < files.length; i++) {
-        const file = files[i];
-        if (!allowedTypes.includes(file.type)) {
-          notifyError(`Invalid file type for ${file.name}. Please select PDF or TXT files only.`);
-          return;
-        }
-        if (file.size > maxSize) {
-          notifyError(`File ${file.name} is too large. Maximum size is 50MB.`);
+        const documentError = validateDocumentUpload(files[i]);
+        if (documentError) {
+          notifyError(documentError);
           return;
         }
       }
@@ -251,21 +243,20 @@ const WorkflowDetail: React.FC = () => {
           base64: string;
           base64Content: string;
           mimeType: string;
-          documentType: 'pdf' | 'txt';
+          documentType: string;
         }>((resolve, reject) => {
           const reader = new FileReader();
 
           reader.onload = (e) => {
             const dataUrl = e.target?.result as string;
             const base64 = dataUrl.split(',')[1];
-            const documentType = file.type === 'application/pdf' ? 'pdf' : 'txt';
 
             resolve({
               file,
               base64: dataUrl,
               base64Content: base64,
-              mimeType: file.type,
-              documentType,
+              mimeType: documentMimeTypeFor(file),
+              documentType: documentTypeFor(file),
             });
           };
 
@@ -726,11 +717,17 @@ const WorkflowDetail: React.FC = () => {
   };
 
   return (
-    <div className="h-full bg-white py-5">
+    <div className="h-full bg-transparent py-5">
       <div className="flex h-full w-full flex-col gap-10">
         <div className="flex items-center justify-between">
-          <p className="text-2xl leading-normal font-semibold text-black">{workflow?.name}</p>
+          <p className="frost-text text-2xl leading-normal font-semibold">{formatAppName(workflow?.name)}</p>
           <div className="flex items-center gap-4">
+            <StreamToggle
+              enabled={listenEventsEnabled}
+              onChange={setListenEventsEnabled}
+              subject="result"
+              liveHint="Shows each step as it runs"
+            />
             {workflowVersions.length > 0 && (
               <Select
                 value={displayVersion !== undefined ? String(displayVersion) : ''}
@@ -766,7 +763,7 @@ const WorkflowDetail: React.FC = () => {
         <div className="flex w-full flex-1 gap-10 pb-5">
           <div className="flex h-full w-full flex-col gap-10">
             <div className="flex h-full flex-col gap-3">
-              <p className="text-lg leading-4 font-medium text-black">Configuration</p>
+              <p className="frost-text text-lg leading-4 font-medium">Configuration</p>
               <CodeMirror
                 value={yamlContent}
                 editable={false}
@@ -781,7 +778,7 @@ const WorkflowDetail: React.FC = () => {
 
           <div className="flex w-full flex-col gap-2">
             <div className="flex items-center justify-between pb-2">
-              <Label htmlFor="output-json-toggle" className="text-sm text-gray-700">
+              <Label htmlFor="output-json-toggle" className="frost-text text-sm">
                 JSON output
               </Label>
               <Switch id="output-json-toggle" checked={outputJsonEnabled} onCheckedChange={setOutputJsonEnabled} />
@@ -810,8 +807,6 @@ const WorkflowDetail: React.FC = () => {
               handleDocumentUpload={handleDocumentUpload}
               uploadingImage={uploadingImage}
               uploadingDocument={uploadingDocument}
-              listenEventsEnabled={listenEventsEnabled}
-              setListenEventsEnabled={setListenEventsEnabled}
               isModelSwitchEnabled={false}
               streamingEvents={streamingEvents}
               isStreaming={isStreaming}

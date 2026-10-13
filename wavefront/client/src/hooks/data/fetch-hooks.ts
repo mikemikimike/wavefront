@@ -1,5 +1,5 @@
-import { DocumentData, InferenceData, KbData } from '@app/api/knowledge-base-service';
-import { ModelData } from '@app/api/model-inference-service';
+import { GuardrailAdapterListData, GuardrailPolicy, PiiEntityListData } from '@app/api/guardrails-service';
+import { DocumentData, KbData, KnowledgeBaseIndexStatusData } from '@app/api/knowledge-base-service';
 import { NamespaceItem } from '@app/api/namespace-service';
 import { useQueryInit } from '@app/lib/react-query';
 import { AgentApi, AgentListItem } from '@app/types/agent';
@@ -8,19 +8,21 @@ import { App } from '@app/types/app';
 import { Authenticator } from '@app/types/authenticator';
 import { Chatbot } from '@app/types/chatbot';
 import { Datasource, DynamicQuery, ReadDynamicQueryData } from '@app/types/datasource';
+import { EmailConnection } from '@app/types/email';
+import { OAuthApp } from '@app/types/oauth-app';
 import { LLMInferenceConfig } from '@app/types/llm-inference-config';
 import { ConfigurationListItem, ConfigurationValue } from '@app/types/configuration';
 import { MessageProcessor, MessageProcessorListItem } from '@app/types/message-processor';
-import { Pipeline, PipelineFile, PipelineStatus } from '@app/types/pipeline';
 import { SttConfig } from '@app/types/stt-config';
 import { TelephonyConfig } from '@app/types/telephony-config';
 import { ToolDetails, VoiceAgentTool, VoiceAgentToolWithAssociation } from '@app/types/tool';
 import { TtsConfig } from '@app/types/tts-config';
 import { VoiceAgent } from '@app/types/voice-agent';
 import { ScheduledJob } from '@app/types/scheduled-job';
-import { WorkflowListItem, WorkflowPipelineListItem, WorkflowRunListData } from '@app/types/workflow';
+import { Trigger } from '@app/types/trigger';
+import { WorkflowListItem } from '@app/types/workflow';
 import { EntityVersion } from '@app/types/version';
-import { UseQueryResult } from '@tanstack/react-query';
+import { UseQueryResult, useQuery } from '@tanstack/react-query';
 
 import { IUser } from '@app/types/user';
 import {
@@ -41,22 +43,25 @@ import {
   getCurrentUserQueryFn,
   getDatasourceQueryFn,
   getDatasourceResourcesQueryFn,
+  getEmailConnectionQueryFn,
+  getEmailConnectionsQueryFn,
+  getOAuthAppQueryFn,
+  getOAuthAppsQueryFn,
   getKnowledgeBaseDocumentsQueryFn,
-  getKnowledgeBaseInferencesQueryFn,
+  getKnowledgeBaseIndexStatusQueryFn,
   getKnowledgeBaseQueryFn,
   getKnowledgeBasesQueryFn,
   getLLMConfigQueryFn,
+  getGuardrailAdaptersQueryFn,
+  getGuardrailPiiEntitiesQueryFn,
+  getGuardrailPoliciesQueryFn,
+  getGuardrailPolicyQueryFn,
   getLLMConfigsQueryFn,
   getConfigurationQueryFn,
   getConfigurationsQueryFn,
   getMessageProcessorQueryFn,
   getMessageProcessorsQueryFn,
-  getModelQueryFn,
-  getModelsQueryFn,
   getNamespacesQueryFn,
-  getPipelineFilesQueryFn,
-  getPipelineQueryFn,
-  getPipelinesQueryFn,
   getSttConfigQueryFn,
   getSttConfigsQueryFn,
   getTelephonyConfigQueryFn,
@@ -70,11 +75,10 @@ import {
   getVoiceAgentToolsQueryFn,
   getAgentToolsQueryFn,
   getVoiceAgentsQueryFn,
-  getWorkflowPipelinesQueryFn,
-  getWorkflowRunsQueryFn,
   getWorkflowsQueryFn,
   readDynamicQueryQueryFn,
   getScheduledJobsQueryFn,
+  getTriggersQueryFn,
 } from './query-functions';
 import {
   getAgentKey,
@@ -94,22 +98,25 @@ import {
   getCurrentUserKey,
   getDatasourceKey,
   getDatasourceResourcesKey,
+  getEmailConnectionKey,
+  getEmailConnectionsKey,
+  getOAuthAppKey,
+  getOAuthAppsKey,
   getKnowledgeBaseDocumentsKey,
-  getKnowledgeBaseInferencesKey,
+  getKnowledgeBaseIndexStatusKey,
   getKnowledgeBaseKey,
   getKnowledgeBasesKey,
   getLLMConfigKey,
+  getGuardrailAdaptersKey,
+  getGuardrailPiiEntitiesKey,
+  getGuardrailPoliciesKey,
+  getGuardrailPolicyKey,
   getLLMConfigsKey,
   getConfigurationKey,
   getConfigurationsKey,
   getMessageProcessorKey,
   getMessageProcessorsKey,
-  getModelKey,
-  getModelsKey,
   getNamespacesKey,
-  getPipelineFilesKey,
-  getPipelineKey,
-  getPipelinesKey,
   getSttConfigKey,
   getSttConfigsKey,
   getTelephonyConfigKey,
@@ -123,11 +130,10 @@ import {
   getVoiceAgentToolsKey,
   getAgentToolsKey,
   getVoiceAgentsKey,
-  getWorkflowPipelinesKey,
-  getWorkflowRunsKey,
   getWorkflowsKey,
   readDynamicQueryKey,
   getScheduledJobsKey,
+  getTriggersKey,
 } from './query-keys';
 
 export const useGetAllApps = (enabled: boolean): UseQueryResult<App[], Error> => {
@@ -218,6 +224,66 @@ export const useGetAuthenticator = (
   );
 };
 
+export const useGetGuardrailPolicies = (appId: string | undefined): UseQueryResult<GuardrailPolicy[], Error> => {
+  return useQueryInit(getGuardrailPoliciesKey(appId || ''), getGuardrailPoliciesQueryFn, !!appId);
+};
+
+export const useGetGuardrailPolicy = (
+  appId: string | undefined,
+  namespace: string | undefined
+): UseQueryResult<GuardrailPolicy | null, Error> => {
+  return useQueryInit(
+    getGuardrailPolicyKey(appId || '', namespace || ''),
+    () => getGuardrailPolicyQueryFn(namespace!),
+    !!appId && !!namespace
+  );
+};
+
+export const useGetGuardrailAdapters = (appId: string | undefined): UseQueryResult<GuardrailAdapterListData, Error> => {
+  return useQueryInit(getGuardrailAdaptersKey(appId || ''), getGuardrailAdaptersQueryFn, !!appId);
+};
+
+/**
+ * The entity types this deployment can detect.
+ *
+ * Fixed for the life of the server process — the recogniser registry is built
+ * once at startup — and the first call pays for loading a spaCy model, so this
+ * is deliberately never refetched.
+ */
+export const useGetGuardrailPiiEntities = (appId: string | undefined): UseQueryResult<PiiEntityListData, Error> => {
+  return useQueryInit(getGuardrailPiiEntitiesKey(appId || ''), getGuardrailPiiEntitiesQueryFn, !!appId);
+};
+
+export const useGetOAuthApps = (appId: string | undefined): UseQueryResult<OAuthApp[], Error> => {
+  return useQueryInit(getOAuthAppsKey(appId || ''), getOAuthAppsQueryFn, !!appId);
+};
+
+export const useGetOAuthApp = (
+  appId: string | undefined,
+  oauthAppId: string | undefined
+): UseQueryResult<OAuthApp | null, Error> => {
+  return useQueryInit(
+    getOAuthAppKey(appId || '', oauthAppId || ''),
+    () => getOAuthAppQueryFn(oauthAppId!),
+    !!appId && !!oauthAppId
+  );
+};
+
+export const useGetEmailConnections = (appId: string | undefined): UseQueryResult<EmailConnection[], Error> => {
+  return useQueryInit(getEmailConnectionsKey(appId || ''), getEmailConnectionsQueryFn, !!appId);
+};
+
+export const useGetEmailConnection = (
+  appId: string | undefined,
+  connectionId: string | undefined
+): UseQueryResult<EmailConnection | null, Error> => {
+  return useQueryInit(
+    getEmailConnectionKey(appId || '', connectionId || ''),
+    () => getEmailConnectionQueryFn(connectionId!),
+    !!appId && !!connectionId
+  );
+};
+
 export const useGetLLMConfigs = (appId: string | undefined): UseQueryResult<LLMInferenceConfig[], Error> => {
   return useQueryInit(getLLMConfigsKey(appId || ''), getLLMConfigsQueryFn, !!appId);
 };
@@ -231,17 +297,6 @@ export const useGetLLMConfig = (
     () => getLLMConfigQueryFn(configId!),
     !!appId && !!configId
   );
-};
-
-export const useGetModels = (appId: string | undefined): UseQueryResult<ModelData[], Error> => {
-  return useQueryInit(getModelsKey(appId || ''), getModelsQueryFn, !!appId);
-};
-
-export const useGetModel = (
-  appId: string | undefined,
-  modelId: string | undefined
-): UseQueryResult<ModelData | null, Error> => {
-  return useQueryInit(getModelKey(appId || '', modelId || ''), () => getModelQueryFn(modelId!), !!appId && !!modelId);
 };
 
 export const useGetKnowledgeBases = (appId: string | undefined): UseQueryResult<KbData[], Error> => {
@@ -270,15 +325,25 @@ export const useGetKnowledgeBaseDocuments = (
   );
 };
 
-export const useGetKnowledgeBaseInferences = (
+// While any document is queued or being indexed, refresh every few seconds so
+// the counts move on their own; stop once everything has settled.
+const INDEX_STATUS_POLL_MS = 5000;
+
+export const useGetKnowledgeBaseIndexStatus = (
   appId: string | undefined,
   kbId: string | undefined
-): UseQueryResult<InferenceData[], Error> => {
-  return useQueryInit(
-    getKnowledgeBaseInferencesKey(appId || '', kbId || ''),
-    () => getKnowledgeBaseInferencesQueryFn(kbId!),
-    !!appId && !!kbId
-  );
+): UseQueryResult<KnowledgeBaseIndexStatusData | null, Error> => {
+  return useQuery({
+    queryKey: getKnowledgeBaseIndexStatusKey(appId || '', kbId || ''),
+    queryFn: () => getKnowledgeBaseIndexStatusQueryFn(kbId!),
+    enabled: !!appId && !!kbId,
+    retry: false,
+    refetchOnWindowFocus: false,
+    refetchInterval: (query) => {
+      const counts = query.state.data?.counts;
+      return counts && counts.QUEUED + counts.IN_PROGRESS > 0 ? INDEX_STATUS_POLL_MS : false;
+    },
+  });
 };
 
 export const useGetWorkflows = (
@@ -286,25 +351,6 @@ export const useGetWorkflows = (
   namespace?: string
 ): UseQueryResult<WorkflowListItem[], Error> => {
   return useQueryInit(getWorkflowsKey(appId || '', namespace), () => getWorkflowsQueryFn(namespace), !!appId);
-};
-
-export const useGetWorkflowPipelines = (
-  appId: string | undefined
-): UseQueryResult<WorkflowPipelineListItem[], Error> => {
-  return useQueryInit(getWorkflowPipelinesKey(appId || ''), getWorkflowPipelinesQueryFn, !!appId);
-};
-
-export const useGetWorkflowRuns = (
-  appId: string | undefined,
-  workflowPipelineId: string | undefined,
-  offset: number = 0,
-  limit: number = 10
-): UseQueryResult<WorkflowRunListData, Error> => {
-  return useQueryInit(
-    getWorkflowRunsKey(appId || '', workflowPipelineId || '', offset, limit),
-    () => getWorkflowRunsQueryFn(workflowPipelineId!, offset, limit),
-    !!appId && !!workflowPipelineId
-  );
 };
 
 export const useGetVoiceAgents = (appId: string | undefined): UseQueryResult<VoiceAgent[], Error> => {
@@ -452,35 +498,6 @@ export const useGetMessageProcessor = (
   );
 };
 
-export const useGetPipelines = (
-  appId: string | undefined,
-  statusFilter?: PipelineStatus | 'all'
-): UseQueryResult<Pipeline[], Error> => {
-  return useQueryInit(getPipelinesKey(appId || '', statusFilter), () => getPipelinesQueryFn(statusFilter), !!appId);
-};
-
-export const useGetPipeline = (
-  appId: string | undefined,
-  pipelineId: string | undefined
-): UseQueryResult<Pipeline | null, Error> => {
-  return useQueryInit(
-    getPipelineKey(appId || '', pipelineId || ''),
-    () => getPipelineQueryFn(pipelineId!),
-    !!appId && !!pipelineId
-  );
-};
-
-export const useGetPipelineFiles = (
-  appId: string | undefined,
-  pipelineId: string | undefined
-): UseQueryResult<PipelineFile[], Error> => {
-  return useQueryInit(
-    getPipelineFilesKey(appId || '', pipelineId || ''),
-    () => getPipelineFilesQueryFn(pipelineId!),
-    !!appId && !!pipelineId
-  );
-};
-
 export const useGetAppById = (appId: string, enabled: boolean = true): UseQueryResult<App | undefined, Error> => {
   return useQueryInit<App | undefined>(getAppByIdKey(appId), () => getAppByIdFn(appId), enabled);
 };
@@ -495,6 +512,10 @@ export const useGetConsoleUsers = (): UseQueryResult<IUser[], Error> => {
 
 export const useGetScheduledJobs = (appId: string | undefined): UseQueryResult<ScheduledJob[], Error> => {
   return useQueryInit(getScheduledJobsKey(appId || ''), getScheduledJobsQueryFn, !!appId);
+};
+
+export const useGetTriggers = (appId: string | undefined): UseQueryResult<Trigger[], Error> => {
+  return useQueryInit(getTriggersKey(appId || ''), getTriggersQueryFn, !!appId);
 };
 
 // Voice Agent Tools Hooks

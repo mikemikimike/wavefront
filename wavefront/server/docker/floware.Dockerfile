@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY --from=ghcr.io/astral-sh/uv:0.8.6 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.12.10 /uv /uvx /bin/
 
 RUN apt-get update && apt-get install -y \
     libpq-dev \
@@ -29,23 +29,25 @@ COPY wavefront/server/modules/auth_module /app/modules/auth_module
 COPY wavefront/server/modules/common_module /app/modules/common_module
 COPY wavefront/server/modules/db_repo_module /app/modules/db_repo_module
 COPY wavefront/server/modules/gold_module /app/modules/gold_module
+COPY wavefront/server/modules/guardrails_module /app/modules/guardrails_module
 COPY wavefront/server/modules/knowledge_base_module /app/modules/knowledge_base_module
 COPY wavefront/server/modules/user_management_module /app/modules/user_management_module
 COPY wavefront/server/modules/llm_inference_config_module /app/modules/llm_inference_config_module
 COPY wavefront/server/modules/agents_module /app/modules/agents_module
 COPY wavefront/server/modules/plugins_module/ /app/modules/plugins_module
 COPY wavefront/server/modules/product_analysis_module /app/modules/product_analysis_module
-COPY wavefront/server/modules/inference_module /app/modules/inference_module
 COPY wavefront/server/modules/tools_module /app/modules/tools_module
 COPY wavefront/server/modules/voice_agents_module /app/modules/voice_agents_module
 COPY wavefront/server/modules/api_services_module /app/modules/api_services_module
-COPY wavefront/server/modules/triggers_module /app/modules/triggers_module
+COPY wavefront/server/modules/chatbots_module /app/modules/chatbots_module
 
 COPY wavefront/server/packages/flo_cloud /app/packages/flo_cloud
 COPY wavefront/server/packages/flo_utils /app/packages/flo_utils
+COPY wavefront/server/packages/flo_lib /app/packages/flo_lib
 
 COPY wavefront/server/plugins/datasource /app/plugins/datasource
 COPY wavefront/server/plugins/authenticator /app/plugins/authenticator
+COPY wavefront/server/plugins/mailer /app/plugins/mailer
 
 COPY wavefront/server/apps/floware /app/apps/floware
 
@@ -53,6 +55,17 @@ COPY wavefront/server/scripts/floware-init.sh /app/scripts/floware-init.sh
 RUN chmod +x /app/scripts/floware-init.sh
 
 RUN uv sync --package floware --frozen --no-dev
+
+# spaCy model for Presidio, which arrives with the flo-ai[guardrails] extra
+# that guardrails_module depends on. The model is not a pip dependency of it,
+# and Presidio downloads one on first use when absent -- which would put a
+# multi-hundred-MB fetch inside the first guarded request.
+#
+# `pip` is installed on purpose: `spacy download` resolves the model version
+# and then shells out to `python -m pip install`, and a uv-created venv has no
+# pip, so the download fails without it.
+RUN uv pip install pip && \
+    /app/.venv/bin/python -m spacy download en_core_web_lg
 
 # Create a non-root user and change ownership of the /app directory
 RUN useradd -m -u 1000 floware && \

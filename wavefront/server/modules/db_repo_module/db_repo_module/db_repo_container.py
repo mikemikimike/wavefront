@@ -1,16 +1,16 @@
 from db_repo_module.cache.cache_manager import CacheManager
+from db_repo_module.cache.redis_settings import RedisSettings
 from db_repo_module.database.connection import DatabaseClient
 from db_repo_module.database.connection import DatabaseConfig
 from db_repo_module.models.auth_secrets import AuthSecrets
 from db_repo_module.models.datasource import Datasource
-from db_repo_module.models.email import Email
-from db_repo_module.models.kb_inferences import KnowledgeBaseInferences
+from db_repo_module.models.email_connection import EmailConnection
+from db_repo_module.models.oauth_app import OAuthApp
 from db_repo_module.models.knowledge_base_documents import KnowledgeBaseDocuments
 from db_repo_module.models.knowledge_base_embeddings import KnowledgeBaseEmbeddings
 from db_repo_module.models.knowledge_bases import KnowledgeBase
 from db_repo_module.models.notification_users import NotificationUser
 from db_repo_module.models.notifications import Notification
-from db_repo_module.models.oauth_credential import OAuthCredential
 from db_repo_module.models.resource import Resource
 from db_repo_module.models.role_resource import RoleResource
 from db_repo_module.models.task import Task
@@ -23,8 +23,6 @@ from db_repo_module.models.datasource_audit_log import DatasourceAuditLog
 from db_repo_module.models.config import Config
 from db_repo_module.models.dynamic_query_yaml import DynamicQueryYaml
 from db_repo_module.models.model_schema import ModelSchema
-from db_repo_module.models.workflow_pipeline import WorkflowPipeline
-from db_repo_module.models.workflow_runs import WorkflowRuns
 from db_repo_module.models.scheduled_job import ScheduledJob
 from db_repo_module.models.scheduled_job_execution import ScheduledJobExecution
 from db_repo_module.repositories.sql_alchemy_repository import SQLAlchemyRepository
@@ -40,7 +38,6 @@ from db_repo_module.models.workflow import Workflow
 from db_repo_module.models.workflow_version import WorkflowVersion
 from db_repo_module.models.api_services import ApiServices
 from db_repo_module.models.async_agentic_execution import AsyncAgenticExecution
-from db_repo_module.models.agentic_trigger_credential import AgenticTriggerCredential
 from db_repo_module.models.agentic_trigger import AgenticTrigger
 from db_repo_module.models.agentic_trigger_event import AgenticTriggerEvent
 from db_repo_module.models.chatbot import Chatbot
@@ -51,7 +48,7 @@ from dependency_injector import providers
 
 
 class DatabaseModuleContainer(containers.DeclarativeContainer):
-    config = providers.Configuration(ini_files=['config.ini'])
+    config = providers.Configuration()
 
     db_config = providers.Factory(
         DatabaseConfig,
@@ -68,13 +65,37 @@ class DatabaseModuleContainer(containers.DeclarativeContainer):
 
     db_client = providers.Singleton(DatabaseClient, db_config=db_config)
 
-    email_repository = providers.Singleton(
-        SQLAlchemyRepository[Email], model=Email, db_client=db_client
+    # Same database, separate pool. RAG ingestion writes (bulk embedding
+    # inserts with HNSW index maintenance) can run long under load; on the
+    # shared pool that starves everything else -- including logins, which
+    # touch a completely unrelated table but wait on the same connection
+    # slots. Isolating it here means ingestion can only exhaust its own pool.
+    ingestion_db_config = providers.Factory(
+        DatabaseConfig,
+        username=config.database.username,
+        password=config.database.password,
+        host=config.database.host,
+        port=config.database.port,
+        db_name=config.database.db_name,
+        pool_size=config.database.ingestion_pool_size,
+        max_overflow=config.database.ingestion_max_overflow,
+        pool_timeout=config.database.ingestion_pool_timeout,
+        pool_recycle=config.database.ingestion_pool_recycle,
     )
 
-    oauth_credential_repository = providers.Singleton(
-        SQLAlchemyRepository[OAuthCredential],
-        model=OAuthCredential,
+    ingestion_db_client = providers.Singleton(
+        DatabaseClient, db_config=ingestion_db_config
+    )
+
+    oauth_app_repository = providers.Singleton(
+        SQLAlchemyRepository[OAuthApp],
+        model=OAuthApp,
+        db_client=db_client,
+    )
+
+    email_connection_repository = providers.Singleton(
+        SQLAlchemyRepository[EmailConnection],
+        model=EmailConnection,
         db_client=db_client,
     )
 
@@ -110,8 +131,21 @@ class DatabaseModuleContainer(containers.DeclarativeContainer):
         db_client=db_client,
     )
 
+    redis_settings = providers.Factory(
+        RedisSettings,
+        host=config.redis.host,
+        port=config.redis.port,
+        protocol=config.redis.protocol,
+        password=config.redis.password,
+        db=config.redis.db,
+        pool_size=config.redis.pool_size,
+        pool_timeout=config.redis.pool_timeout,
+    )
+
     cache_manager = providers.Singleton(
-        CacheManager, namespace=config.env_config.app_name
+        CacheManager,
+        namespace=config.env_config.app_name,
+        settings=redis_settings,
     )
 
     knowledge_base_repository = providers.Singleton(
@@ -129,12 +163,6 @@ class DatabaseModuleContainer(containers.DeclarativeContainer):
     knowledge_base_embeddings_repository = providers.Singleton(
         SQLAlchemyRepository[KnowledgeBaseEmbeddings],
         model=KnowledgeBaseEmbeddings,
-        db_client=db_client,
-    )
-
-    kb_inference_repository = providers.Singleton(
-        SQLAlchemyRepository[KnowledgeBaseInferences],
-        model=KnowledgeBaseInferences,
         db_client=db_client,
     )
 
@@ -189,18 +217,6 @@ class DatabaseModuleContainer(containers.DeclarativeContainer):
     sift_features_repository = providers.Singleton(
         SQLAlchemyRepository[SIFTFeatures],
         model=SIFTFeatures,
-        db_client=db_client,
-    )
-
-    workflow_pipeline_repository = providers.Singleton(
-        SQLAlchemyRepository[WorkflowPipeline],
-        model=WorkflowPipeline,
-        db_client=db_client,
-    )
-
-    workflow_runs_repository = providers.Singleton(
-        SQLAlchemyRepository[WorkflowRuns],
-        model=WorkflowRuns,
         db_client=db_client,
     )
 
@@ -266,21 +282,10 @@ class DatabaseModuleContainer(containers.DeclarativeContainer):
         model=ScheduledJobExecution,
         db_client=db_client,
     )
-    knowledge_base_inference_repository = providers.Singleton(
-        SQLAlchemyRepository[KnowledgeBaseInferences],
-        model=KnowledgeBaseInferences,
-        db_client=db_client,
-    )
 
     async_agentic_execution_repository = providers.Singleton(
         SQLAlchemyRepository[AsyncAgenticExecution],
         model=AsyncAgenticExecution,
-        db_client=db_client,
-    )
-
-    agentic_trigger_credential_repository = providers.Singleton(
-        SQLAlchemyRepository[AgenticTriggerCredential],
-        model=AgenticTriggerCredential,
         db_client=db_client,
     )
 

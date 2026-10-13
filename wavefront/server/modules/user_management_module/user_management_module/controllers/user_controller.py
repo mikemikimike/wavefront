@@ -1,10 +1,8 @@
 import secrets
 from typing import List, Optional
+from urllib.parse import quote
 
-from common_module.feature.feature_flag import (
-    ALLOW_NON_ADMIN_ALL_DATA_ACCESS_FLAG,
-    is_feature_enabled,
-)
+from common_module.feature.feature_flag import ALLOW_NON_ADMIN_ALL_DATA_ACCESS_FLAG
 from common_module.log.logger import logger
 from db_repo_module.models.resource import Resource
 from db_repo_module.models.resource import ResourceScope
@@ -15,7 +13,7 @@ from db_repo_module.models.user_group import UserGroup
 from db_repo_module.models.user_group_member import UserGroupMember
 from db_repo_module.models.user_role import UserRole
 from dependency_injector.wiring import inject
-from fastapi import Path, Query
+from fastapi import BackgroundTasks, Path, Query
 from fastapi import Request
 from fastapi import status
 from fastapi.responses import JSONResponse
@@ -37,7 +35,9 @@ from user_management_module.dependencies.injection import (
     AccountLockoutServiceDep,
     CacheManagerDep,
     CommonCacheDep,
-    EmailServiceDep,
+    EmailSenderDep,
+    RecaptchaServiceDep,
+    FeatureFlagsDep,
     ResponseFormatterDep,
     TokenServiceDep,
     UserConfigDep,
@@ -45,20 +45,38 @@ from user_management_module.dependencies.injection import (
     UserRoleRepositoryDep,
     UserServiceDep,
 )
+from user_management_module.constants.auth import PASSWORD_RESET_TOKEN_PURPOSE
 from user_management_module.constants.cache import (
     USER_DATA_PATTERN,
+    password_reset_latest_key,
     user_by_id_cache_key,
     user_list_cache_key,
 )
-from user_management_module.models.user_schema import NewUser
-from user_management_module.models.user_schema import ResetUser
-from user_management_module.models.user_schema import UpdateUser
+from user_management_module.models.user_schema import (
+    NewUser,
+    ResetUser,
+    SendResetPasswordEmailRequest,
+    UpdateUser,
+)
+from user_management_module.utils.email_templates import (
+    PASSWORD_RESET_SUBJECT,
+    build_password_reset_email,
+)
 from user_management_module.utils.password_utils import hash_password
+from user_management_module.utils.rate_limit import (
+    password_reset_cooldown_seconds,
+    password_reset_rate_limited,
+)
 from user_management_module.utils.user_utils import (
     can_read_users,
     check_is_admin,
+    normalize_email,
 )
 from user_management_module.utils.user_utils import get_current_user
+from user_management_module.services.recaptcha_service import (
+    RECAPTCHA_ACTION_RESET_PASSWORD,
+    RECAPTCHA_ACTION_SEND_RESET_PASSWORD,
+)
 import json
 from common_module.utils.serializer import serialize_values
 from common_module.utils.validators import is_valid_uuid
@@ -84,6 +102,45 @@ def _password_reset_generic_response(response_formatter) -> JSONResponse:
         status_code=status.HTTP_200_OK,
         content=response_formatter.buildSuccessResponse(
             {'message': PASSWORD_RESET_GENERIC_MESSAGE}
+        ),
+    )
+
+
+PASSWORD_RESET_INVALID_MESSAGE = (
+    "Sorry, we couldn't verify your identity, or your password reset link "
+    'has expired. Please try again or request a new reset link.'
+)
+
+
+def _password_reset_invalid_response(response_formatter) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND,
+        content=response_formatter.buildErrorResponse(PASSWORD_RESET_INVALID_MESSAGE),
+    )
+
+
+async def _deliver_password_reset_email(
+    email_sender, recipients: str, reset_url: str
+) -> None:
+    try:
+        email_response = await email_sender.send(
+            subject=PASSWORD_RESET_SUBJECT,
+            body_html=build_password_reset_email(reset_url),
+            recipients=recipients,
+        )
+        if not email_response:
+            logger.error('Error while sending password reset email')
+    except Exception as exc:
+        logger.error(f'Error while sending password reset email: {exc}')
+
+
+def _recaptcha_failure_response(
+    response_formatter, error_message: Optional[str]
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content=response_formatter.buildErrorResponse(
+            error_message or 'reCAPTCHA verification failed'
         ),
     )
 
@@ -456,11 +513,14 @@ async def get_all_user(
     response_formatter: ResponseFormatterDep,
     user_repository: UserRepositoryDep,
     cache_manager: CacheManagerDep,
-    search: Optional[str] = Query(None, description='Search by name or email'),
+    feature_flags: FeatureFlagsDep,
+    search: Optional[str] = Query(
+        None, max_length=200, description='Search by name or email'
+    ),
     roles: Optional[List[str]] = Query(None, description='Filter by role name'),
-    limit: int = Query(100),
-    offset: int = Query(0),
-    force_fetch: int = Query(0),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    force_fetch: int = Query(0, ge=0, le=1),
 ):
     """List users.
 
@@ -475,7 +535,7 @@ async def get_all_user(
     role_id, _, _ = get_current_user(request)
     is_admin = await check_is_admin(role_id)
 
-    if not is_admin and not is_feature_enabled(ALLOW_NON_ADMIN_ALL_DATA_ACCESS_FLAG):
+    if not is_admin and not feature_flags.enabled(ALLOW_NON_ADMIN_ALL_DATA_ACCESS_FLAG):
         return JSONResponse(
             status_code=status.HTTP_401_UNAUTHORIZED,
             content=response_formatter.buildErrorResponse('Access denied'),
@@ -634,7 +694,7 @@ async def get_user(
     user_repository: UserRepositoryDep,
     cache_manager: CacheManagerDep,
     user_id: str = Path(..., description='User id to fetch'),
-    force_fetch: int = Query(0),
+    force_fetch: int = Query(0, ge=0, le=1),
 ):
     """Fetch one user by id — name and email, without roles.
 
@@ -762,7 +822,7 @@ async def delete_user(
     user_repository: UserRepositoryDep,
     user_service: UserServiceDep,
     cache_manager: CacheManagerDep,
-    delete_id: str = Query(alias='id'),
+    delete_id: str = Query(alias='id', min_length=1, max_length=100),
 ):
     role_id, user_id, _ = get_current_user(request)
     is_admin = await check_is_admin(role_id)
@@ -771,6 +831,14 @@ async def delete_user(
         return JSONResponse(
             status_code=status.HTTP_401_UNAUTHORIZED,
             content=response_formatter.buildErrorResponse('Access denied'),
+        )
+
+    if not is_valid_uuid(delete_id):
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=response_formatter.buildErrorResponse(
+                f'Invalid user id: {delete_id}'
+            ),
         )
 
     # Counted across direct assignments and group membership alike, so the last
@@ -815,16 +883,36 @@ async def delete_user(
 @user_router.post('/user/send-reset-password-email')
 @inject
 async def send_reset_url(
-    email: str,
+    payload: SendResetPasswordEmailRequest,
+    background_tasks: BackgroundTasks,
     user_repository: UserRepositoryDep,
     user_reset_cache: CommonCacheDep,
     response_formatter: ResponseFormatterDep,
     token_service: TokenServiceDep,
     config: UserConfigDep,
-    email_service: EmailServiceDep,
+    email_sender: EmailSenderDep,
     account_lockout_service: AccountLockoutServiceDep,
+    recaptcha_service: RecaptchaServiceDep,
 ):
+    is_recaptcha_valid, recaptcha_error = await recaptcha_service.verify(
+        payload.recaptcha_token, action=RECAPTCHA_ACTION_SEND_RESET_PASSWORD
+    )
+    if not is_recaptcha_valid:
+        return _recaptcha_failure_response(response_formatter, recaptcha_error)
+
+    email = normalize_email(payload.email)
     try:
+        # Rate-limit before the lookup so a 429 never depends on whether the
+        # account exists. Per-address only; the load balancer covers IP/volume.
+        if password_reset_rate_limited(user_reset_cache, config, email):
+            return JSONResponse(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                content=response_formatter.buildErrorResponse(
+                    PASSWORD_RESET_GENERIC_MESSAGE
+                ),
+                headers={'Retry-After': str(password_reset_cooldown_seconds(config))},
+            )
+
         # checking if the user exists in the db
         user_with_email = await user_repository.find_one(email=email)
         if not user_with_email or user_with_email.deleted:
@@ -846,28 +934,39 @@ async def send_reset_url(
         random_digit = secrets.token_hex(16)
 
         decoded_url = token_service.create_token(
-            payload={'code': random_digit},
+            payload={
+                'code': random_digit,
+                'purpose': PASSWORD_RESET_TOKEN_PURPOSE,
+            },
             is_temporary=True,
         )
 
-        # creating the user in the user_reset table
+        # A new request supersedes any earlier unused link for this user.
+        pointer_key = password_reset_latest_key(str(user_with_email.id))
+        previous_code = user_reset_cache.pop_str(pointer_key)
+        if previous_code:
+            user_reset_cache.remove(previous_code)
         user_reset_cache.add(random_digit, str(user_with_email.id), expiry=600)
+        user_reset_cache.add(pointer_key, random_digit, expiry=600)
 
         # generating the url
-        forget_url_link = f'{config["web"]["url"]}/reset-password?token={decoded_url}'
-
-        # setting up the emial part
-        email_response = email_service.send_forget_password_email(
-            forget_url_link, email
+        forget_url_link = (
+            f'{config["web"]["url"]}/reset-password?token={quote(decoded_url, safe="")}'
         )
-        if not email_response:
-            # Reachable only for an address that does resolve to a user, so a
-            # distinct error here would leak exactly what the generic message
-            # above is protecting.
-            logger.error('Error while sending password reset email')
+
+        # Sent from the primary email connection, so changing the platform
+        # sender is an admin action rather than a redeploy. The send runs after
+        # the response so SMTP latency cannot distinguish a live address.
+        background_tasks.add_task(
+            _deliver_password_reset_email,
+            email_sender,
+            email,
+            forget_url_link,
+        )
+
         return _password_reset_generic_response(response_formatter)
-    except ValueError:
-        logger.error('Error in email sending credentials')
+    except Exception as exc:
+        logger.error(f'Password reset request failed: {exc}', exc_info=True)
         return _password_reset_generic_response(response_formatter)
 
 
@@ -879,36 +978,63 @@ async def reset_password(
     token_service: TokenServiceDep,
     user_reset_cache: CommonCacheDep,
     user_repository: UserRepositoryDep,
+    user_service: UserServiceDep,
+    recaptcha_service: RecaptchaServiceDep,
 ):
+    is_recaptcha_valid, recaptcha_error = await recaptcha_service.verify(
+        reset_user.recaptcha_token, action=RECAPTCHA_ACTION_RESET_PASSWORD
+    )
+    if not is_recaptcha_valid:
+        return _recaptcha_failure_response(response_formatter, recaptcha_error)
+
     try:
-        decoded_url = token_service.decode_token(reset_user.secret_token)
-        existing_user_id = user_reset_cache.get_str(decoded_url['code'])
-        if not existing_user_id:
-            return JSONResponse(
-                status_code=status.HTTP_404_NOT_FOUND,
-                content=response_formatter.buildErrorResponse(
-                    "Sorry, we couldn't verify your identity, or your password reset link has expired. Please try again or request a new reset link."
-                ),
-            )
-        hashed_password = hash_password(reset_user.new_password)
-        await user_repository.find_one_and_update(
-            {'id': existing_user_id}, password=hashed_password
+        decoded = token_service.decode_token(reset_user.secret_token)
+    except jwt.PyJWTError as exc:
+        logger.warning(f'Rejected password reset token: {exc}')
+        return _password_reset_invalid_response(response_formatter)
+
+    # Production verify failure returns {} rather than raising, and a token
+    # minted for another purpose must not be spendable here.
+    if not decoded or decoded.get('purpose') != PASSWORD_RESET_TOKEN_PURPOSE:
+        return _password_reset_invalid_response(response_formatter)
+    code = decoded.get('code')
+    if not code:
+        return _password_reset_invalid_response(response_formatter)
+
+    # pop_str is GETDEL: two concurrent requests cannot both win the token.
+    # The token is burned before the write, so a failed update means
+    # requesting a fresh link — that is the price of a single-use guarantee.
+    existing_user_id = user_reset_cache.pop_str(code)
+    if not existing_user_id:
+        return _password_reset_invalid_response(response_formatter)
+
+    user = await user_repository.find_one(id=existing_user_id)
+    if not user or user.deleted:
+        return _password_reset_invalid_response(response_formatter)
+
+    hashed_password = hash_password(reset_user.new_password)
+    updated_user = await user_repository.find_one_and_update(
+        {'id': existing_user_id}, password=hashed_password
+    )
+    if updated_user is None:
+        return _password_reset_invalid_response(response_formatter)
+
+    # Invalidate sessions before clearing the reset pointer. Auth trusts a
+    # session cache hit without a DB check, so a pointer-remove failure must
+    # not skip invalidation and leave existing sessions authorized.
+    await user_service.invalidate_user_sessions(str(existing_user_id))
+    try:
+        user_reset_cache.remove(password_reset_latest_key(str(existing_user_id)))
+    except Exception as exc:
+        logger.error(
+            f'Failed to clear password-reset pointer for user {existing_user_id}: {exc}'
         )
-        # removing the user from user reset table  after updating the password
-        user_reset_cache.remove(decoded_url['code'])
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content=response_formatter.buildSuccessResponse(
-                {'message': 'Your password has been updated successfully.'}
-            ),
-        )
-    except jwt.ExpiredSignatureError:
-        return JSONResponse(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            content=response_formatter.buildErrorResponse(
-                'The password reset link has expired. Please request a new one.'
-            ),
-        )
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content=response_formatter.buildSuccessResponse(
+            {'message': 'Your password has been updated successfully.'}
+        ),
+    )
 
 
 @user_router.get('/whoami')
@@ -976,7 +1102,7 @@ async def unblock_user(
     request: Request,
     response_formatter: ResponseFormatterDep,
     account_lockout_service: AccountLockoutServiceDep,
-    user_id: str = Path(..., description='User id to unblock'),
+    user_id: str = Path(..., description='User id to unblock', max_length=100),
 ):
     role_id, _, _ = get_current_user(request)
     is_admin = await check_is_admin(role_id)
@@ -985,6 +1111,14 @@ async def unblock_user(
         return JSONResponse(
             status_code=status.HTTP_401_UNAUTHORIZED,
             content=response_formatter.buildErrorResponse('Access denied'),
+        )
+
+    if not is_valid_uuid(user_id):
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=response_formatter.buildErrorResponse(
+                f'Invalid user id: {user_id}'
+            ),
         )
 
     try:

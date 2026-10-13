@@ -119,24 +119,22 @@ service:
 
 
 @pytest.fixture
-async def validation_service_registry(payload_validation_yaml):
+async def validation_service_registry(
+    payload_validation_yaml, api_services_manager_cls
+):
     """Service registry with validation-enabled service."""
-    from tests.conftest import MockApiServicesManager
-
     yaml_map = {'test-validation-service': payload_validation_yaml}
-    manager = MockApiServicesManager(service_yaml_map=yaml_map)
+    manager = api_services_manager_cls(service_yaml_map=yaml_map)
     registry = ServiceRegistry(manager)
     await registry.load_from_db()
     return registry
 
 
 @pytest.fixture
-async def complex_types_registry(complex_types_yaml):
+async def complex_types_registry(complex_types_yaml, api_services_manager_cls):
     """Service registry with complex types validation."""
-    from tests.conftest import MockApiServicesManager
-
     yaml_map = {'complex-types-service': complex_types_yaml}
-    manager = MockApiServicesManager(service_yaml_map=yaml_map)
+    manager = api_services_manager_cls(service_yaml_map=yaml_map)
     registry = ServiceRegistry(manager)
     await registry.load_from_db()
     return registry
@@ -815,7 +813,7 @@ async def test_proxy_successful_with_valid_payload(validation_service_registry):
         'email': 'john@test.com',
     }
 
-    with patch('httpx.AsyncClient') as mock_client_class:
+    with patch('flo_lib.http.AsyncClient') as mock_client_class:
         mock_client = AsyncMock()
         mock_client.request = AsyncMock(return_value=mock_response)
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)

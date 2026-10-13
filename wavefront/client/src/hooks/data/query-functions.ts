@@ -1,16 +1,17 @@
 import floConsoleService from '@app/api';
-import { DocumentData, InferenceData, KbData } from '@app/api/knowledge-base-service';
-import { ModelData } from '@app/api/model-inference-service';
+import { GuardrailAdapterListData, GuardrailPolicy, PiiEntityListData } from '@app/api/guardrails-service';
+import { DocumentData, KbData, KnowledgeBaseIndexStatusData } from '@app/api/knowledge-base-service';
 import { NamespaceItem } from '@app/api/namespace-service';
 import { AgentApi, AgentListItem } from '@app/types/agent';
 import { ApiServiceItem } from '@app/types/api-service';
 import { Authenticator } from '@app/types/authenticator';
+import { EmailConnection } from '@app/types/email';
+import { OAuthApp } from '@app/types/oauth-app';
 import { Chatbot } from '@app/types/chatbot';
 import { ConfigurationListItem, ConfigurationValue } from '@app/types/configuration';
 import { Datasource, DynamicQuery, ReadDynamicQueryData } from '@app/types/datasource';
 import { LLMInferenceConfig } from '@app/types/llm-inference-config';
 import { MessageProcessor, MessageProcessorListItem } from '@app/types/message-processor';
-import { Pipeline, PipelineFile, PipelineStatus } from '@app/types/pipeline';
 import { SttConfig } from '@app/types/stt-config';
 import { TelephonyConfig } from '@app/types/telephony-config';
 import { ToolDetails, VoiceAgentTool, VoiceAgentToolWithAssociation } from '@app/types/tool';
@@ -18,7 +19,8 @@ import { TtsConfig } from '@app/types/tts-config';
 import { IUser } from '@app/types/user';
 import { VoiceAgent } from '@app/types/voice-agent';
 import { ScheduledJob } from '@app/types/scheduled-job';
-import { WorkflowListItem, WorkflowPipelineListItem, WorkflowRunListData } from '@app/types/workflow';
+import { Trigger } from '@app/types/trigger';
+import { WorkflowListItem } from '@app/types/workflow';
 import { EntityVersion } from '@app/types/version';
 
 const SCHEDULED_JOBS_PAGE_SIZE = 20;
@@ -133,28 +135,70 @@ const getAuthenticatorQueryFn = async (authId: string): Promise<Authenticator | 
   return null;
 };
 
+const getGuardrailPoliciesQueryFn = async (): Promise<GuardrailPolicy[]> => {
+  const response = await floConsoleService.guardrailsService.listPolicies();
+  if (response.data?.meta?.status === 'success' && response.data.data?.policies) {
+    return response.data.data.policies;
+  }
+  return [];
+};
+
+const getOAuthAppsQueryFn = async (): Promise<OAuthApp[]> => {
+  const response = await floConsoleService.oauthAppService.getAllOAuthApps();
+  if (response.data?.meta?.status === 'success' && response.data.data?.apps) {
+    return response.data.data.apps;
+  }
+  return [];
+};
+
+const getGuardrailPolicyQueryFn = async (namespace: string): Promise<GuardrailPolicy | null> => {
+  const response = await floConsoleService.guardrailsService.getPolicy(namespace);
+  if (response.data?.meta?.status === 'success' && response.data.data?.policy) {
+    return response.data.data.policy;
+  }
+  return null;
+};
+
+const getGuardrailAdaptersQueryFn = async (): Promise<GuardrailAdapterListData> => {
+  const response = await floConsoleService.guardrailsService.listSupportedAdapters();
+  if (response.data?.meta?.status === 'success' && response.data.data) {
+    return response.data.data;
+  }
+  return { adapters: [], unavailable: [] };
+};
+
+const getGuardrailPiiEntitiesQueryFn = async (): Promise<PiiEntityListData> => {
+  const response = await floConsoleService.guardrailsService.listPiiEntities();
+  if (response.data?.meta?.status === 'success' && response.data.data) {
+    return response.data.data;
+  }
+  return { groups: [], available: false };
+};
+
+const getOAuthAppQueryFn = async (oauthAppId: string): Promise<OAuthApp | null> => {
+  const response = await floConsoleService.oauthAppService.getOAuthApp(oauthAppId);
+  return response.data?.data?.app ?? null;
+};
+
+const getEmailConnectionsQueryFn = async (): Promise<EmailConnection[]> => {
+  const response = await floConsoleService.emailConnectionService.getAllEmailConnections();
+  if (response.data?.meta?.status === 'success' && response.data.data?.connections) {
+    return response.data.data.connections;
+  }
+  return [];
+};
+
+const getEmailConnectionQueryFn = async (connectionId: string): Promise<EmailConnection | null> => {
+  const response = await floConsoleService.emailConnectionService.getEmailConnection(connectionId);
+  return response.data?.data?.connection ?? null;
+};
+
 const getLLMConfigsQueryFn = async (): Promise<LLMInferenceConfig[]> => {
   const response = await floConsoleService.llmInferenceService.listAllLLMConfigs();
   if (response.data?.meta?.status === 'success' && response.data.data?.configs) {
     return response.data.data.configs;
   }
   return [];
-};
-
-const getModelsQueryFn = async (): Promise<ModelData[]> => {
-  const response = await floConsoleService.modelInferenceService.listAllModels();
-  if (response.data?.meta?.status === 'success' && response.data.data?.data) {
-    return response.data.data.data;
-  }
-  return [];
-};
-
-const getModelQueryFn = async (modelId: string): Promise<ModelData | null> => {
-  const response = await floConsoleService.modelInferenceService.getModel(modelId);
-  if (response.data?.meta?.status === 'success' && response.data.data?.data) {
-    return response.data.data.data;
-  }
-  return null;
 };
 
 const getKnowledgeBasesQueryFn = async (): Promise<KbData[]> => {
@@ -181,12 +225,9 @@ const getKnowledgeBaseDocumentsQueryFn = async (kbId: string): Promise<DocumentD
   return [];
 };
 
-const getKnowledgeBaseInferencesQueryFn = async (kbId: string): Promise<InferenceData[]> => {
-  const response = await floConsoleService.knowledgeBaseService.listInferencesForKnowledgeBase(kbId);
-  if (response.data?.data?.resources) {
-    return response.data.data.resources;
-  }
-  return [];
+const getKnowledgeBaseIndexStatusQueryFn = async (kbId: string): Promise<KnowledgeBaseIndexStatusData | null> => {
+  const response = await floConsoleService.knowledgeBaseService.getKnowledgeBaseIndexStatus(kbId);
+  return response.data?.data ?? null;
 };
 
 const getWorkflowsQueryFn = async (namespace?: string): Promise<WorkflowListItem[]> => {
@@ -195,32 +236,6 @@ const getWorkflowsQueryFn = async (namespace?: string): Promise<WorkflowListItem
     return response.data.data.data.workflows;
   }
   return [];
-};
-
-const getWorkflowPipelinesQueryFn = async (): Promise<WorkflowPipelineListItem[]> => {
-  const response = await floConsoleService.workflowService.listWorkflowPipelines();
-  if (response.data?.meta?.status === 'success' && response.data.data?.workflow_pipelines) {
-    return response.data.data.workflow_pipelines;
-  }
-  return [];
-};
-
-const getWorkflowRunsQueryFn = async (
-  workflowPipelineId: string,
-  offset: number = 0,
-  limit: number = 10
-): Promise<WorkflowRunListData> => {
-  const response = await floConsoleService.workflowService.getWorkflowRuns(workflowPipelineId, offset, limit);
-  if (response.data?.meta?.status === 'success' && response.data.data) {
-    return response.data.data;
-  }
-  return {
-    workflow_runs: [],
-    total_count: 0,
-    page_size: limit,
-    page_number: Math.floor(offset / limit),
-    total_pages: 0,
-  };
 };
 
 const getChatbotsQueryFn = async (namespace?: string): Promise<Chatbot[]> => {
@@ -385,35 +400,6 @@ const getLLMConfigQueryFn = async (configId: string): Promise<LLMInferenceConfig
   return null;
 };
 
-const getPipelinesQueryFn = async (statusFilter?: PipelineStatus | 'all'): Promise<Pipeline[]> => {
-  const pipelineService = floConsoleService.dataPipelineService;
-  const response = await (statusFilter === 'all' || !statusFilter
-    ? pipelineService.listPipelines()
-    : pipelineService.listPipelines(statusFilter));
-  if (response.data?.data?.pipelines) {
-    return response.data.data.pipelines;
-  }
-  return [];
-};
-
-const getPipelineQueryFn = async (pipelineId: string): Promise<Pipeline | null> => {
-  const pipelineService = floConsoleService.dataPipelineService;
-  const response = await pipelineService.getPipeline(pipelineId);
-  if (response.data?.data?.pipeline) {
-    return response.data.data.pipeline;
-  }
-  return null;
-};
-
-const getPipelineFilesQueryFn = async (pipelineId: string): Promise<PipelineFile[]> => {
-  const pipelineService = floConsoleService.dataPipelineService;
-  const response = await pipelineService.listFiles(pipelineId);
-  if (response.data?.data?.files) {
-    return response.data.data.files;
-  }
-  return [];
-};
-
 const getAppByIdFn = async (appId: string) => {
   const {
     data: { data },
@@ -482,6 +468,14 @@ const getScheduledJobsQueryFn = async (): Promise<ScheduledJob[]> => {
   return jobs.slice(0, MAX_SCHEDULED_JOBS);
 };
 
+const getTriggersQueryFn = async (): Promise<Trigger[]> => {
+  const response = await floConsoleService.triggerService.listTriggers({ limit: 500 });
+  if (response.data?.meta?.status === 'success' && Array.isArray(response.data.data?.data)) {
+    return response.data.data.data.filter((trigger) => trigger.status !== 'deleted');
+  }
+  return [];
+};
+
 export {
   getAgentQueryFn,
   getAgentVersionsQueryFn,
@@ -497,26 +491,29 @@ export {
   getAppUsersQueryFn,
   getAuthenticatorQueryFn,
   getAuthenticatorsQueryFn,
+  getEmailConnectionQueryFn,
+  getEmailConnectionsQueryFn,
+  getOAuthAppQueryFn,
+  getOAuthAppsQueryFn,
   getChatbotsQueryFn,
   getCurrentUserQueryFn,
   getDatasourceQueryFn,
   getDatasourceResourcesQueryFn,
   getKnowledgeBaseDocumentsQueryFn,
-  getKnowledgeBaseInferencesQueryFn,
+  getKnowledgeBaseIndexStatusQueryFn,
   getKnowledgeBaseQueryFn,
   getKnowledgeBasesQueryFn,
   getLLMConfigQueryFn,
+  getGuardrailAdaptersQueryFn,
+  getGuardrailPiiEntitiesQueryFn,
+  getGuardrailPoliciesQueryFn,
+  getGuardrailPolicyQueryFn,
   getLLMConfigsQueryFn,
   getMessageProcessorQueryFn,
   getConfigurationQueryFn,
   getConfigurationsQueryFn,
   getMessageProcessorsQueryFn,
-  getModelQueryFn,
-  getModelsQueryFn,
   getNamespacesQueryFn,
-  getPipelineFilesQueryFn,
-  getPipelineQueryFn,
-  getPipelinesQueryFn,
   getSttConfigQueryFn,
   getSttConfigsQueryFn,
   getTelephonyConfigQueryFn,
@@ -529,9 +526,8 @@ export {
   getVoiceAgentToolQueryFn,
   getVoiceAgentToolsQueryFn,
   getVoiceAgentsQueryFn,
-  getWorkflowPipelinesQueryFn,
-  getWorkflowRunsQueryFn,
   getWorkflowsQueryFn,
   readDynamicQueryQueryFn,
   getScheduledJobsQueryFn,
+  getTriggersQueryFn,
 };

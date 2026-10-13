@@ -3,7 +3,7 @@ import logging
 import re
 import ssl
 import jwt
-import requests
+import flo_lib.http as http
 from datetime import datetime
 from jwt import PyJWKClient
 from typing import Dict, Any, Optional
@@ -210,7 +210,7 @@ class MicrosoftADFSAuthenticator(AuthenticatorABC):
         }
 
         try:
-            response = requests.post(
+            response = http.post(
                 self.token_url,
                 data=data,
                 timeout=10,
@@ -226,7 +226,7 @@ class MicrosoftADFSAuthenticator(AuthenticatorABC):
                 expires_in=token_data.get('expires_in'),
             )
 
-        except requests.exceptions.RequestException as e:
+        except http.HTTPError as e:
             return TokenResult(success=False, error=f'Token refresh failed: {str(e)}')
         except json.JSONDecodeError:
             return TokenResult(
@@ -248,9 +248,7 @@ class MicrosoftADFSAuthenticator(AuthenticatorABC):
             f'{self.config.authority.rstrip("/")}/adfs/.well-known/openid-configuration'
         )
         try:
-            response = requests.get(
-                discovery_url, timeout=5, verify=self.config.verify_ssl
-            )
+            response = http.get(discovery_url, timeout=5, verify=self.config.verify_ssl)
             details['discovery_reachable'] = response.status_code == 200
             if response.status_code != 200:
                 is_healthy = False
@@ -287,7 +285,7 @@ class MicrosoftADFSAuthenticator(AuthenticatorABC):
         logger.debug('ADFS token exchange: POST %s', self.token_url)
 
         try:
-            response = requests.post(
+            response = http.post(
                 self.token_url,
                 data=data,
                 timeout=10,
@@ -306,7 +304,6 @@ class MicrosoftADFSAuthenticator(AuthenticatorABC):
                 bool(token_data.get('refresh_token')),
                 token_data.get('expires_in'),
             )
-            logger.debug('ADFS id_token=%s', id_token)
 
             return (
                 TokenResult(
@@ -318,7 +315,7 @@ class MicrosoftADFSAuthenticator(AuthenticatorABC):
                 id_token,
             )
 
-        except requests.exceptions.RequestException as e:
+        except http.HTTPError as e:
             logger.debug('ADFS token exchange request failed: %s', e)
             return (
                 TokenResult(success=False, error=f'Token exchange failed: {str(e)}'),
@@ -492,7 +489,12 @@ class MicrosoftADFSAuthenticator(AuthenticatorABC):
                 decode_kwargs['issuer'] = self.config.expected_issuer
 
             claims = jwt.decode(id_token, signing_key.key, **decode_kwargs)
-            logger.debug('ADFS id_token claims decoded: %s', claims)
+            # Claim names only - the values carry PII (email, upn, names).
+            logger.debug(
+                'ADFS claims decoded: sub=%s keys=%s',
+                claims.get('sub'),
+                sorted(claims),
+            )
 
             if expected_nonce is not None and claims.get('nonce') != expected_nonce:
                 logger.warning('ADFS id_token nonce mismatch')

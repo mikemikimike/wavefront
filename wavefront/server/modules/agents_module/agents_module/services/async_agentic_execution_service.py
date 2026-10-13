@@ -2,6 +2,8 @@ import asyncio
 import base64
 import binascii
 import json
+import math
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -12,14 +14,24 @@ from db_repo_module.cache.cache_manager import CacheManager
 from db_repo_module.models.async_agentic_execution import AsyncAgenticExecution
 from db_repo_module.repositories.sql_alchemy_repository import SQLAlchemyRepository
 from flo_cloud.cloud_storage import CloudStorageManager
+from sqlalchemy import func, or_, select
 
 from agents_module.models.async_agentic_execution_schemas import (
     AsyncInferenceResponse,
     AgenticExecutionStatusResponse,
 )
-from agents_module.utils.celery_client import get_celery_client
+from celery import Celery
 from agents_module.utils.execution_variable_utils import with_execution_variables
-from agents_module.utils.mime_type_utils import split_data_url
+from agents_module.utils.mime_type_utils import (
+    SUPPORTED_DOCUMENT_MIME_TYPES,
+    SUPPORTED_IMAGE_MIME_TYPES,
+    resolve_mime_type,
+    split_data_url,
+)
+
+# The only types written as their real content type. Everything else is stored
+# as an opaque download rather than trusting a caller-supplied string.
+_STORABLE_CONTENT_TYPES = SUPPORTED_IMAGE_MIME_TYPES | SUPPORTED_DOCUMENT_MIME_TYPES
 
 _MIME_TO_EXT = {
     'application/pdf': '.pdf',
@@ -31,6 +43,8 @@ _MIME_TO_EXT = {
     'image/svg+xml': '.svg',
     'text/plain': '.txt',
     'text/csv': '.csv',
+    'application/msword': '.doc',
+    'application/vnd.ms-excel': '.xls',
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
 }
@@ -41,16 +55,129 @@ _WORKFLOW_TASK_NAME = 'celery_worker.tasks.workflow_task.execute_workflow_task'
 _STATUS_CACHE_TTL_TERMINAL = 3600  # 1 hour for completed/failed
 _STATUS_CACHE_TTL_ACTIVE = 10  # 10 seconds for pending/in_progress
 
+# Stands in for the stored exception text on the execution-read endpoints. The
+# execution id is already in the same payload, so a user reporting a failure
+# still has the one identifier support needs to look up the real error.
+GENERIC_EXECUTION_ERROR = (
+    'Execution failed. Contact your administrator with the execution id for details.'
+)
+
 
 def _cache_key(execution_id: UUID) -> str:
     return f'async_agentic_exec:status:{execution_id}'
 
 
+# For the storage *key* only. Anything outside this set becomes '_', so the
+# key cannot carry a path, an extension, or anything else meaningful to a web
+# server. Deliberately stricter than ensure_safe_file_name's blocklist, which
+# guards the display name and has to keep non-Latin characters intact: a key
+# has no reason to be readable in every script, a display name does.
+_UNSAFE_KEY_CHARS = re.compile(r'[^A-Za-z0-9_-]')
+_MAX_NAME_STEM = 64
+
+
 def _safe_filename(idx: int, file_name: Optional[str], mime_type: Optional[str]) -> str:
+    """Build the stored object name from the *validated* mime type.
+
+    The extension decides how a web server treats the object, so it is derived
+    from the mime type the gate verified against the file's magic bytes — never
+    from the caller's file name, which previously went through verbatim and let
+    `shell.php` become the stored key.
+
+    The caller's name is kept as the stem, stripped of anything that is not a
+    letter, digit, hyphen or underscore. That also disposes of `../`, since a
+    separator is not in the allowed set.
+    """
+    # Only a type the gate accepts earns a real extension. _MIME_TO_EXT is the
+    # wider map used elsewhere and still lists `.svg`, `.csv` and friends; an
+    # unreachable entry today is a drift hazard tomorrow, and `.svg` in
+    # particular is served inline. Anything else is stored as `.bin`.
+    ext = (
+        _MIME_TO_EXT.get(mime_type or '', '.bin')
+        if mime_type in _STORABLE_CONTENT_TYPES
+        else '.bin'
+    )
+
+    stem = ''
     if file_name:
-        return f'{idx}_{file_name}'
-    ext = _MIME_TO_EXT.get(mime_type or '', '.bin')
-    return f'{idx}_file{ext}'
+        # Drop the caller's extension before sanitising: it is replaced, not
+        # kept, and leaving it would just add noise like 'shell_php'.
+        stem = str(file_name).rsplit('.', 1)[0]
+        stem = _UNSAFE_KEY_CHARS.sub('_', stem)[:_MAX_NAME_STEM].strip('_')
+
+    return f'{idx}_{stem}{ext}' if stem else f'{idx}_file{ext}'
+
+
+def _coerce_json_scalar(value: str) -> Any:
+    """The same text as a JSON number or bool, or None if it is neither.
+
+    None also covers the literal `null`: a filter cannot usefully ask for a
+    null-valued variable.
+    """
+    lowered = value.lower()
+    if lowered in ('true', 'false'):
+        return lowered == 'true'
+
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        return None
+
+    if not isinstance(parsed, (int, float)):
+        return None
+
+    # json takes `Infinity`/`-Infinity`/`NaN` and overflows a big exponent to
+    # inf, then writes them back under those same spellings -- which Postgres
+    # rejects as invalid json. Not coercing leaves the text term, so
+    # `?variable.x=NaN` matches the string instead of 500ing.
+    if isinstance(parsed, float) and not math.isfinite(parsed):
+        return None
+
+    return parsed
+
+
+def _variable_containment(key: str, value: str):
+    """One containment term for a filtered variable, tolerant of stored type.
+
+    `@>` matches by JSON type but a filter value is always text, so the
+    number/bool reading is OR'd in to keep `?variable.n=5` finding {"n": 5}.
+    Both halves stay `@>` rather than `->>`, which a jsonb_ops GIN index cannot
+    serve; the key travels as a bound JSONB param, never as SQL text.
+    """
+    column = AsyncAgenticExecution.variables
+    term = column.contains({key: value})
+
+    coerced = _coerce_json_scalar(value)
+    if coerced is None:
+        return term
+
+    return or_(term, column.contains({key: coerced}))
+
+
+def _build_execution_filters(
+    entity_id: Optional[UUID],
+    entity_type: Optional[str],
+    status: Optional[str],
+    variables: Optional[Dict[str, str]],
+) -> List[Any]:
+    """Predicates for a listing, shared by the page query and the COUNT.
+
+    One builder for both, so they cannot disagree about what is counted.
+    """
+    predicates: List[Any] = []
+
+    if entity_id:
+        predicates.append(AsyncAgenticExecution.entity_id == entity_id)
+    if entity_type:
+        predicates.append(AsyncAgenticExecution.entity_type == entity_type)
+    if status:
+        predicates.append(AsyncAgenticExecution.status == status)
+
+    # Sorted so the SQL shape does not depend on query-string order.
+    for key, value in sorted((variables or {}).items()):
+        predicates.append(_variable_containment(key, value))
+
+    return predicates
 
 
 class AsyncAgenticExecutionService:
@@ -60,11 +187,13 @@ class AsyncAgenticExecutionService:
         cloud_storage_manager: CloudStorageManager,
         cache_manager: CacheManager,
         executions_bucket: str,
+        celery_client: Celery,
     ):
         self.repo = async_agentic_execution_repository
         self.cloud_storage = cloud_storage_manager
         self.cache = cache_manager
         self.bucket = executions_bucket
+        self.celery = celery_client
 
     def pre_save_binary_inputs(
         self,
@@ -126,6 +255,13 @@ class AsyncAgenticExecutionService:
                     raw_b64 = stripped_b64
                     mime_type = mime_type or data_url_mime
 
+                # Fall back to the file name exactly as the gate does. The gate
+                # accepts `photo.png` with no `mime_type` field by resolving the
+                # extension; resolving it only there would store a valid image
+                # as an unnamed `.bin` octet-stream, which the UI cannot render
+                # from its presigned URL.
+                mime_type = resolve_mime_type(mime_type, file_name=file_name)
+
                 safe_name = _safe_filename(idx, file_name, mime_type)
                 key = f'{prefix}inputs/{safe_name}'
 
@@ -135,10 +271,17 @@ class AsyncAgenticExecutionService:
                     raise ValueError(
                         f'Invalid base64 data for input at index {idx}: {exc}'
                     ) from exc
+                # Store the type explicitly rather than letting the provider
+                # guess from the key, and only ever a type the gate accepts —
+                # an unrecognised one is stored as an opaque download so it
+                # cannot be served as script or markup.
                 self.cloud_storage.save_small_file(
                     file_content=file_bytes,
                     bucket_name=self.bucket,
                     key=key,
+                    content_type=mime_type
+                    if mime_type in _STORABLE_CONTENT_TYPES
+                    else 'application/octet-stream',
                 )
 
                 ref = {
@@ -212,7 +355,7 @@ class AsyncAgenticExecutionService:
         }
 
         try:
-            result = get_celery_client().send_task(
+            result = self.celery.send_task(
                 _AGENT_TASK_NAME,
                 kwargs={'payload': payload},
             )
@@ -285,7 +428,7 @@ class AsyncAgenticExecutionService:
         }
 
         try:
-            result = get_celery_client().send_task(
+            result = self.celery.send_task(
                 _WORKFLOW_TASK_NAME,
                 kwargs={'payload': payload},
             )
@@ -313,7 +456,10 @@ class AsyncAgenticExecutionService:
         )
 
     def _build_status_response(
-        self, record_dict: Dict, generate_urls: bool = True
+        self,
+        record_dict: Dict,
+        generate_urls: bool = True,
+        include_error: bool = False,
     ) -> AgenticExecutionStatusResponse:
         output_url = None
         history_url = None
@@ -327,8 +473,8 @@ class AsyncAgenticExecutionService:
                 output_url = self.cloud_storage.generate_presigned_url(
                     bucket_name=record_dict['input_bucket'],
                     key=record_dict['output_file'],
-                    type='get',
-                    expiresIn=900,
+                    operation='get',
+                    expires_in=900,
                 )
             except Exception as e:
                 logger.warning(f'Failed to generate output presigned URL: {e}')
@@ -342,8 +488,8 @@ class AsyncAgenticExecutionService:
                 history_url = self.cloud_storage.generate_presigned_url(
                     bucket_name=record_dict['input_bucket'],
                     key=record_dict['history_file'],
-                    type='get',
-                    expiresIn=900,
+                    operation='get',
+                    expires_in=900,
                 )
             except Exception as e:
                 logger.warning(f'Failed to generate history presigned URL: {e}')
@@ -363,11 +509,28 @@ class AsyncAgenticExecutionService:
                     input_file['url'] = self.cloud_storage.generate_presigned_url(
                         bucket_name=record_dict['input_bucket'],
                         key=input_file['key'],
-                        type='get',
-                        expiresIn=900,
+                        operation='get',
+                        expires_in=900,
                     )
                 except Exception as e:
                     logger.warning(f'Failed to generate input presigned URL: {e}')
+
+        # The stored error is a raw exception string — it has carried host
+        # names and stack detail — so it is swapped for a fixed message unless
+        # the caller is entitled to it. Still non-null when the run failed, so
+        # a client renders the same field either way.
+        #
+        # Keyed off status, not off the column: the consumer only writes `error`
+        # when the worker supplies text and only clears it on `in_progress`, so
+        # the column alone is neither. A failure reported without a message
+        # leaves it null, and a retry that reaches `completed` without passing
+        # through `in_progress` leaves the previous attempt's text behind.
+        raw_error = record_dict.get('error')
+        error = None
+        if record_dict['status'] == 'failed':
+            error = (
+                raw_error if include_error and raw_error else GENERIC_EXECUTION_ERROR
+            )
 
         return AgenticExecutionStatusResponse(
             id=uuid.UUID(record_dict['id']),
@@ -375,7 +538,7 @@ class AsyncAgenticExecutionService:
             entity_id=uuid.UUID(record_dict['entity_id']),
             celery_task_id=record_dict.get('celery_task_id'),
             status=record_dict['status'],
-            error=record_dict.get('error'),
+            error=error,
             variables=record_dict.get('variables'),
             input_files=input_files,
             output_url=output_url,
@@ -390,14 +553,18 @@ class AsyncAgenticExecutionService:
         )
 
     async def get_execution_status(
-        self, execution_id: UUID
+        self, execution_id: UUID, include_error: bool = False
     ) -> AgenticExecutionStatusResponse:
         cache_key = _cache_key(execution_id)
         cached = await asyncio.to_thread(self.cache.get_str, cache_key)
 
         if cached:
             logger.debug(f'Cache hit for execution status {execution_id}')
-            return self._build_status_response(json.loads(cached))
+            # The cache holds the raw record, not the response, so it is shared
+            # across both values of include_error without leaking either way.
+            return self._build_status_response(
+                json.loads(cached), include_error=include_error
+            )
 
         record = await self.repo.find_one(id=execution_id)
         if not record:
@@ -412,35 +579,48 @@ class AsyncAgenticExecutionService:
         )
         await asyncio.to_thread(self.cache.add, cache_key, json.dumps(record_dict), ttl)
 
-        return self._build_status_response(record_dict)
+        return self._build_status_response(record_dict, include_error=include_error)
 
     async def list_executions(
         self,
         entity_id: Optional[UUID] = None,
         entity_type: Optional[str] = None,
         status: Optional[str] = None,
+        variables: Optional[Dict[str, str]] = None,
         offset: int = 0,
         limit: int = 50,
+        include_error: bool = False,
     ) -> Tuple[List[AgenticExecutionStatusResponse], int]:
-        filters: Dict[str, Any] = {}
-        if entity_id:
-            filters['entity_id'] = entity_id
-        if entity_type:
-            filters['entity_type'] = entity_type
-        if status:
-            filters['status'] = status
+        """List executions newest first, optionally narrowed by stored variables.
 
-        total = await self.repo.count(**filters)
+        `variables` is a subset match: a row qualifies only if it carries every
+        pair. Queried through the session, not the generic repository, whose
+        `find`/`count` only express column equality -- which also buys a real
+        SQL OFFSET instead of over-fetching and slicing in Python.
+        """
+        predicates = _build_execution_filters(entity_id, entity_type, status, variables)
 
-        records = await self.repo.find(
-            **filters,
-            limit=offset + limit,
-            order_by=('created_at', 'desc'),
-        )
-        records = records[offset:]
+        async with self.repo.session() as session:
+            total = await session.scalar(
+                select(func.count())
+                .select_from(AsyncAgenticExecution)
+                .where(*predicates)
+            )
+
+            records = (
+                await session.scalars(
+                    select(AsyncAgenticExecution)
+                    .where(*predicates)
+                    .order_by(AsyncAgenticExecution.created_at.desc())
+                    .offset(offset)
+                    .limit(limit)
+                )
+            ).all()
 
         results = [
-            self._build_status_response(r.to_dict(), generate_urls=False)
+            self._build_status_response(
+                r.to_dict(), generate_urls=False, include_error=include_error
+            )
             for r in records
         ]
         return results, total

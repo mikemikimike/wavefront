@@ -1,6 +1,5 @@
 from datetime import datetime, timedelta, timezone
 import json
-import os
 from unittest.mock import Mock
 from uuid import uuid4
 
@@ -13,13 +12,25 @@ from db_repo_module.models.user import User
 from db_repo_module.models.user_role import UserRole
 from dependency_injector import providers
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker
+from user_management_module.constants.cache import get_session_cache_key
 from user_management_module.constants.cache import user_by_id_cache_key
 from user_management_module.utils.password_utils import hash_password
 
 
+def _set_inactive_account_flag(core_containers, enabled: bool) -> None:
+    from common_module.feature.feature_flag import FeatureFlags
+
+    core_containers.common.feature_flags.override(
+        providers.Object(FeatureFlags(inactive_account_disable=enabled))
+    )
+
+
 @pytest.mark.asyncio
-async def test_authenticate(test_client, test_session: AsyncSession, test_user_id):
+async def test_authenticate(
+    test_client, test_session: async_sessionmaker, test_user_id
+):
     # Create test IDs
     role_id = str(uuid4())
     resource_id = str(uuid4())
@@ -76,7 +87,7 @@ async def test_authenticate(test_client, test_session: AsyncSession, test_user_i
 
 @pytest.mark.asyncio
 async def test_authenticate_invalid_role(
-    test_client, test_session: AsyncSession, test_user_id
+    test_client, test_session: async_sessionmaker, test_user_id
 ):
     # Hash the password before storing it
     hashed_password = hash_password('test_password')
@@ -102,7 +113,7 @@ async def test_authenticate_invalid_role(
 
 @pytest.mark.asyncio
 async def test_authenticate_invalid_password(
-    test_client, test_session: AsyncSession, test_user_id
+    test_client, test_session: async_sessionmaker, test_user_id
 ):
     # Hash the password before storing it
     hashed_password = hash_password('test_password')
@@ -127,10 +138,52 @@ async def test_authenticate_invalid_password(
     assert response.status_code == 403
 
 
+@pytest.mark.asyncio
+async def test_authenticate_rejects_invalid_email_format(test_client):
+    response = test_client.post(
+        '/floware/v1/authenticate',
+        json={'email': 'not-an-email', 'password': 'anything'},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_authenticate_rejects_oversized_password(test_client):
+    response = test_client.post(
+        '/floware/v1/authenticate',
+        json={'email': 'test@example.com', 'password': 'x' * 73},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_authenticate_rejects_empty_password(test_client):
+    response = test_client.post(
+        '/floware/v1/authenticate',
+        json={'email': 'test@example.com', 'password': ''},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_authenticate_does_not_enforce_password_complexity(test_client):
+    """Login must not apply create/reset strength rules — only length/email format."""
+    response = test_client.post(
+        '/floware/v1/authenticate',
+        json={'email': 'nobody@example.com', 'password': 'simple'},
+    )
+    # Passed request validation (not 422). Auth failure is expected for unknown user.
+    assert response.status_code == 403
+
+
 # testing auth logout
 @pytest.mark.asyncio
 async def test_logout(
-    test_client, auth_token, test_session: AsyncSession, test_user_id, test_session_id
+    test_client,
+    auth_token,
+    test_session: async_sessionmaker,
+    test_user_id,
+    test_session_id,
 ):
     user = User(
         id=test_user_id,
@@ -160,7 +213,7 @@ async def test_logout(
 async def test_logout_invalid_cache(
     test_client,
     auth_token,
-    test_session: AsyncSession,
+    test_session: async_sessionmaker,
     test_user_id,
     test_session_id,
     setup_containers,
@@ -182,11 +235,11 @@ async def test_logout_invalid_cache(
 
 @pytest.mark.asyncio
 async def test_authenticate_multiple_failed_attempts_lockout(
-    test_client, test_session: AsyncSession, test_user_id
+    test_client, test_session: async_sessionmaker, test_user_id
 ):
     """Test that multiple failed login attempts result in account lockout"""
-    # Get max failed attempts from environment variable, default to 3
-    max_failed_attempts = int(os.getenv('MAX_FAILED_ATTEMPTS', 3))
+    # Matches flo_testing user_config auth.max_failed_attempts default.
+    max_failed_attempts = 3
 
     # Create test IDs
     role_id = str(uuid4())
@@ -250,11 +303,11 @@ async def test_authenticate_multiple_failed_attempts_lockout(
 
 @pytest.mark.asyncio
 async def test_authenticate_with_already_locked_account(
-    test_client, test_session: AsyncSession, test_user_id
+    test_client, test_session: async_sessionmaker, test_user_id
 ):
     """Test authentication attempt with an already locked account"""
-    # Get max failed attempts from environment variable, default to 3
-    max_failed_attempts = int(os.getenv('MAX_FAILED_ATTEMPTS', 3))
+    # Matches flo_testing user_config auth.max_failed_attempts default.
+    max_failed_attempts = 3
 
     hashed_password = hash_password('test_password')
     current_time = datetime.now(timezone.utc)
@@ -288,11 +341,11 @@ async def test_authenticate_with_already_locked_account(
 
 @pytest.mark.asyncio
 async def test_authenticate_resets_failed_attempts_on_success(
-    test_client, test_session: AsyncSession, test_user_id
+    test_client, test_session: async_sessionmaker, test_user_id
 ):
     """Test that successful login resets failed attempts counter"""
-    # Get max failed attempts from environment variable, default to 3
-    max_failed_attempts = int(os.getenv('MAX_FAILED_ATTEMPTS', 3))
+    # Matches flo_testing user_config auth.max_failed_attempts default.
+    max_failed_attempts = 3
 
     # Create test IDs
     role_id = str(uuid4())
@@ -351,25 +404,19 @@ async def test_authenticate_resets_failed_attempts_on_success(
 
 @pytest.mark.asyncio
 async def test_authenticate_inactive_account_feature_disabled(
-    test_client, test_session: AsyncSession, test_user_id, monkeypatch, mock_config
+    test_client,
+    test_session: async_sessionmaker,
+    test_user_id,
+    monkeypatch,
+    core_containers,
+    mock_config,
 ):
     """Test that inactive users can login when feature flag is disabled"""
     # Get threshold from config (same config that service uses)
     threshold_days = int(mock_config['auth']['inactive_days_threshold'])
 
     # Mock the feature flag to be disabled
-    def mock_is_feature_enabled(feature: str) -> bool:
-        if feature == 'INACTIVE_ACCOUNT_DISABLE_FLAG':
-            return False
-        return False
-
-    monkeypatch.setattr(
-        'common_module.feature.feature_flag.is_feature_enabled', mock_is_feature_enabled
-    )
-    monkeypatch.setattr(
-        'user_management_module.controllers.auth_controller.is_feature_enabled',
-        mock_is_feature_enabled,
-    )
+    _set_inactive_account_flag(core_containers, False)
 
     # Create test IDs
     role_id = str(uuid4())
@@ -421,23 +468,17 @@ async def test_authenticate_inactive_account_feature_disabled(
 
 @pytest.mark.asyncio
 async def test_authenticate_inactive_account_feature_enabled_first_time_user(
-    test_client, test_session: AsyncSession, test_user_id, monkeypatch, mock_config
+    test_client,
+    test_session: async_sessionmaker,
+    test_user_id,
+    monkeypatch,
+    core_containers,
+    mock_config,
 ):
     """Test that first-time users (no last_login_at) can login when feature is enabled"""
 
     # Mock the feature flag to be enabled
-    def mock_is_feature_enabled(feature: str) -> bool:
-        if feature == 'INACTIVE_ACCOUNT_DISABLE_FLAG':
-            return True
-        return False
-
-    monkeypatch.setattr(
-        'common_module.feature.feature_flag.is_feature_enabled', mock_is_feature_enabled
-    )
-    monkeypatch.setattr(
-        'user_management_module.controllers.auth_controller.is_feature_enabled',
-        mock_is_feature_enabled,
-    )
+    _set_inactive_account_flag(core_containers, True)
 
     # Create test IDs
     role_id = str(uuid4())
@@ -486,25 +527,19 @@ async def test_authenticate_inactive_account_feature_enabled_first_time_user(
 
 @pytest.mark.asyncio
 async def test_authenticate_inactive_account_feature_enabled_within_threshold(
-    test_client, test_session: AsyncSession, test_user_id, monkeypatch, mock_config
+    test_client,
+    test_session: async_sessionmaker,
+    test_user_id,
+    monkeypatch,
+    core_containers,
+    mock_config,
 ):
     """Test that active users within threshold can login when feature is enabled"""
     # Get threshold from config (same config that service uses)
     threshold_days = int(mock_config['auth']['inactive_days_threshold'])
 
     # Mock the feature flag to be enabled
-    def mock_is_feature_enabled(feature: str) -> bool:
-        if feature == 'INACTIVE_ACCOUNT_DISABLE_FLAG':
-            return True
-        return False
-
-    monkeypatch.setattr(
-        'common_module.feature.feature_flag.is_feature_enabled', mock_is_feature_enabled
-    )
-    monkeypatch.setattr(
-        'user_management_module.controllers.auth_controller.is_feature_enabled',
-        mock_is_feature_enabled,
-    )
+    _set_inactive_account_flag(core_containers, True)
 
     # Create test IDs
     role_id = str(uuid4())
@@ -556,25 +591,19 @@ async def test_authenticate_inactive_account_feature_enabled_within_threshold(
 
 @pytest.mark.asyncio
 async def test_authenticate_inactive_account_feature_enabled_over_threshold(
-    test_client, test_session: AsyncSession, test_user_id, monkeypatch, mock_config
+    test_client,
+    test_session: async_sessionmaker,
+    test_user_id,
+    monkeypatch,
+    core_containers,
+    mock_config,
 ):
     """Test that inactive users over threshold are rejected when feature is enabled"""
     # Get threshold from config (same config that service uses)
     threshold_days = int(mock_config['auth']['inactive_days_threshold'])
 
     # Mock the feature flag to be enabled
-    def mock_is_feature_enabled(feature: str) -> bool:
-        if feature == 'INACTIVE_ACCOUNT_DISABLE_FLAG':
-            return True
-        return False
-
-    monkeypatch.setattr(
-        'common_module.feature.feature_flag.is_feature_enabled', mock_is_feature_enabled
-    )
-    monkeypatch.setattr(
-        'user_management_module.controllers.auth_controller.is_feature_enabled',
-        mock_is_feature_enabled,
-    )
+    _set_inactive_account_flag(core_containers, True)
 
     # Create test IDs
     role_id = str(uuid4())
@@ -627,7 +656,7 @@ async def test_authenticate_inactive_account_feature_enabled_over_threshold(
 
 @pytest.mark.asyncio
 async def test_authenticate_updates_last_login_timestamp(
-    test_client, test_session: AsyncSession, test_user_id
+    test_client, test_session: async_sessionmaker, test_user_id
 ):
     """Test that successful login updates user's last_login_at timestamp"""
     # Create test IDs
@@ -700,25 +729,19 @@ async def test_authenticate_updates_last_login_timestamp(
 
 @pytest.mark.asyncio
 async def test_authenticate_inactive_account_with_wrong_password(
-    test_client, test_session: AsyncSession, test_user_id, monkeypatch, mock_config
+    test_client,
+    test_session: async_sessionmaker,
+    test_user_id,
+    monkeypatch,
+    core_containers,
+    mock_config,
 ):
     """Test that inactivity error takes precedence over wrong password error"""
     # Get threshold from config (same config that service uses)
     threshold_days = int(mock_config['auth']['inactive_days_threshold'])
 
     # Mock the feature flag to be enabled
-    def mock_is_feature_enabled(feature: str) -> bool:
-        if feature == 'INACTIVE_ACCOUNT_DISABLE_FLAG':
-            return True
-        return False
-
-    monkeypatch.setattr(
-        'common_module.feature.feature_flag.is_feature_enabled', mock_is_feature_enabled
-    )
-    monkeypatch.setattr(
-        'user_management_module.controllers.auth_controller.is_feature_enabled',
-        mock_is_feature_enabled,
-    )
+    _set_inactive_account_flag(core_containers, True)
 
     # Create test IDs
     role_id = str(uuid4())
@@ -775,28 +798,22 @@ async def test_authenticate_inactive_account_with_wrong_password(
 
 @pytest.mark.asyncio
 async def test_authenticate_inactive_account_with_lockout(
-    test_client, test_session: AsyncSession, test_user_id, monkeypatch, mock_config
+    test_client,
+    test_session: async_sessionmaker,
+    test_user_id,
+    monkeypatch,
+    core_containers,
+    mock_config,
 ):
     """Test that lockout error takes precedence over inactivity error"""
     # Get threshold from config (same config that service uses)
     threshold_days = int(mock_config['auth']['inactive_days_threshold'])
 
     # Mock the feature flag to be enabled
-    def mock_is_feature_enabled(feature: str) -> bool:
-        if feature == 'INACTIVE_ACCOUNT_DISABLE_FLAG':
-            return True
-        return False
+    _set_inactive_account_flag(core_containers, True)
 
-    monkeypatch.setattr(
-        'common_module.feature.feature_flag.is_feature_enabled', mock_is_feature_enabled
-    )
-    monkeypatch.setattr(
-        'user_management_module.controllers.auth_controller.is_feature_enabled',
-        mock_is_feature_enabled,
-    )
-
-    # Get max failed attempts from environment variable, default to 3
-    max_failed_attempts = int(os.getenv('MAX_FAILED_ATTEMPTS', 3))
+    # Matches flo_testing user_config auth.max_failed_attempts default.
+    max_failed_attempts = 3
 
     hashed_password = hash_password('test_password')
     current_time = datetime.now(timezone.utc)
@@ -835,7 +852,7 @@ async def test_authenticate_inactive_account_with_lockout(
 
 @pytest.mark.asyncio
 async def test_locked_account_wrong_password_increments_attempts(
-    test_client, test_session: AsyncSession, test_user_id
+    test_client, test_session: async_sessionmaker, test_user_id
 ):
     """Wrong passwords while locked keep updating attempt count and timestamp."""
     hashed_password = hash_password('test_password')
@@ -884,7 +901,7 @@ async def test_locked_account_wrong_password_increments_attempts(
 
 @pytest.mark.asyncio
 async def test_locked_account_correct_password_does_not_increment_attempts(
-    test_client, test_session: AsyncSession, test_user_id
+    test_client, test_session: async_sessionmaker, test_user_id
 ):
     """A correct password during lockout is blocked but not counted as a failure."""
     hashed_password = hash_password('test_password')
@@ -919,7 +936,7 @@ async def test_locked_account_correct_password_does_not_increment_attempts(
 
 @pytest.mark.asyncio
 async def test_successful_login_refreshes_user_cache_with_last_login(
-    test_client, test_session: AsyncSession, test_user_id, setup_containers
+    test_client, test_session: async_sessionmaker, test_user_id, setup_containers
 ):
     """Successful login updates last_login_at in DB and the shared user cache."""
     role_id = str(uuid4())
@@ -990,3 +1007,123 @@ async def test_successful_login_refreshes_user_cache_with_last_login(
     assert cached_login == updated_login
     assert latest['failed_attempts'] == 0
     assert latest['last_failed_attempt'] is None
+
+
+@pytest.mark.asyncio
+async def test_authenticate_after_lockout_expiry_resets_attempts(
+    test_client, test_session: async_sessionmaker, test_user_id, mock_config
+):
+    """Expired lock clears the slate so the next failure starts at attempt 1."""
+    hashed_password = hash_password('correct_password')
+    # Far past so DB timezone stripping cannot make the lock look current.
+    expired = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+    async with test_session() as session:
+        user = User(
+            id=test_user_id,
+            email='expired_lock@example.com',
+            password=hashed_password,
+            first_name='Test',
+            last_name='User',
+            failed_attempts=5,
+            locked_until=expired,
+            last_failed_attempt=expired,
+        )
+        session.add(user)
+        await session.commit()
+
+    response = test_client.post(
+        '/floware/v1/authenticate',
+        json={'email': 'expired_lock@example.com', 'password': 'wrong_password'},
+    )
+    assert response.status_code == 403
+
+    async with test_session() as session:
+        from sqlalchemy import select
+
+        refreshed = (
+            await session.execute(
+                select(User).where(User.email == 'expired_lock@example.com')
+            )
+        ).scalar_one()
+        assert refreshed.failed_attempts == 1
+        assert refreshed.locked_until is None
+
+
+@pytest.mark.asyncio
+async def test_authenticate_recaptcha_blocks_when_enabled(
+    test_client, core_containers, monkeypatch
+):
+    from user_management_module.services.recaptcha_service import RecaptchaService
+
+    enabled = RecaptchaService(
+        enabled=True, project_id='p', site_key='s', score_threshold=0.5
+    )
+    core_containers.user.recaptcha_service.override(providers.Object(enabled))
+    try:
+        response = test_client.post(
+            '/floware/v1/authenticate',
+            json={'email': 'a@example.com', 'password': 'x'},
+        )
+        assert response.status_code == 403
+        assert 'recaptcha' in str(response.json()).lower()
+    finally:
+        core_containers.user.recaptcha_service.reset_override()
+
+
+@pytest.mark.asyncio
+async def test_authenticate_replaces_existing_sessions(
+    test_client, test_session: async_sessionmaker, test_user_id, core_containers
+):
+    role_id = str(uuid4())
+    resource_id = str(uuid4())
+    old_session_id = uuid4()
+
+    async with test_session() as session:
+        session.add(
+            User(
+                id=test_user_id,
+                email='test@example.com',
+                password=hash_password('test_password'),
+                first_name='Test',
+                last_name='User',
+            )
+        )
+        session.add(Role(id=role_id, name='Test Role', description='Test Role'))
+        session.add(
+            Resource(
+                id=resource_id,
+                key='console_resource',
+                value='test_resource',
+                description='Test Resource',
+                scope=ResourceScope.CONSOLE,
+            )
+        )
+        await session.flush()
+        session.add(RoleResource(role_id=role_id, resource_id=resource_id))
+        session.add(UserRole(user_id=test_user_id, role_id=role_id))
+        # An orphan left behind by a session that was never logged out.
+        session.add(Session(id=old_session_id, user_id=test_user_id, device_info='old'))
+        await session.commit()
+
+    response = test_client.post(
+        '/floware/v1/authenticate',
+        json={'email': 'test@example.com', 'password': 'test_password'},
+    )
+    assert response.status_code == 200
+
+    core_containers.cache_manager.remove.assert_any_call(
+        get_session_cache_key(old_session_id)
+    )
+    async with test_session() as session:
+        remaining = (
+            (
+                await session.execute(
+                    select(Session).where(Session.user_id == test_user_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(remaining) == 1
+    assert remaining[0].id != old_session_id

@@ -1,13 +1,12 @@
 from datetime import datetime
 from typing import Optional
 
+from common_module.common_container import CommonContainer
 from common_module.feature.feature_flag import (
     ALLOW_NON_ADMIN_ALL_DATA_ACCESS_FLAG,
-    is_feature_enabled,
+    FeatureFlags,
 )
 from common_module.response_formatter import ResponseFormatter
-import uuid
-from typing import Union
 from db_repo_module.models.role import Role
 from db_repo_module.repositories.sql_alchemy_repository import SQLAlchemyRepository
 from dependency_injector.wiring import inject
@@ -17,11 +16,21 @@ from fastapi import status
 from fastapi.params import Depends
 from fastapi.responses import JSONResponse
 from user_management_module.constants.auth import ADMIN_ROLE_NAME
+from user_management_module.constants.auth import MANAGER_ROLE_NAME
 from user_management_module.constants.auth import SERVICE_AUTH_ROLE_ID
 from user_management_module.services.account_lockout_service import (
     AccountLockoutService,
 )
 from user_management_module.user_container import UserContainer
+
+
+def normalize_email(email: str) -> str:
+    """Canonical email form for Floware: trimmed lowercase.
+
+    All auth and user lookups must use this so mixed-case credentials still
+    resolve after the DB stores only lowercase addresses.
+    """
+    return str(email).strip().lower()
 
 
 def get_current_user(req: Request):
@@ -32,6 +41,13 @@ def get_current_user(req: Request):
         if hasattr(req.state, 'session') and req.state.session
         else None,
     )
+
+
+async def _role_name(
+    role_id: str, role_repository: SQLAlchemyRepository[Role]
+) -> Optional[str]:
+    role = await role_repository.find_one(id=role_id)
+    return role.name if role else None
 
 
 @inject
@@ -48,15 +64,33 @@ async def check_is_admin(
     """
     if role_id == SERVICE_AUTH_ROLE_ID:
         return True
-    role = await role_repository.find_one(id=role_id)
 
-    if not role:
+    return await _role_name(role_id, role_repository) == ADMIN_ROLE_NAME
+
+
+@inject
+async def check_is_manager(
+    role_id: str,
+    role_repository: SQLAlchemyRepository[Role] = Depends(
+        Provide[UserContainer.role_repository]
+    ),
+) -> bool:
+    """True when the session role is the built-in manager role.
+
+    Service identities are admins, not managers, so they take the admin path
+    and are never group-scoped by it.
+    """
+    if role_id == SERVICE_AUTH_ROLE_ID:
         return False
 
-    return role.name == ADMIN_ROLE_NAME
+    return await _role_name(role_id, role_repository) == MANAGER_ROLE_NAME
 
 
-async def can_read_users(req: Request) -> bool:
+@inject
+async def can_read_users(
+    req: Request,
+    feature_flags: FeatureFlags = Depends(Provide[CommonContainer.feature_flags]),
+) -> bool:
     """Read access for the fetch-by-id user endpoint.
 
     Admin-only by default. Deployments where every authenticated user needs to
@@ -69,7 +103,7 @@ async def can_read_users(req: Request) -> bool:
     admin bit also selects which payload shape to build, not just whether to
     answer at all.
     """
-    if is_feature_enabled(ALLOW_NON_ADMIN_ALL_DATA_ACCESS_FLAG):
+    if feature_flags.enabled(ALLOW_NON_ADMIN_ALL_DATA_ACCESS_FLAG):
         return True
 
     role_id, _, _ = get_current_user(req)
@@ -107,7 +141,3 @@ def create_account_lockout_response(
         status_code=status.HTTP_423_LOCKED,
         content=response_formatter.buildErrorResponse(error_message),
     )
-
-
-def get_session_cache_key(session_id: Union[str, uuid.UUID]) -> str:
-    return f'session_{str(session_id)}'

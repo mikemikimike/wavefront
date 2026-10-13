@@ -1,5 +1,5 @@
 from uuid import UUID
-from typing import Optional
+from typing import Dict, Optional
 
 from fastapi import APIRouter, Depends, Query, Request, status
 from fastapi.responses import JSONResponse
@@ -18,12 +18,58 @@ from agents_module.models.agent_schemas import AgentInferenceRequest
 from agents_module.models.workflow_schemas import WorkflowInferenceRequest
 from agents_module.utils.auth_utils import extract_auth_credentials
 from agents_module.utils.input_processing_utils import validate_inference_inputs_media
+from agents_module.utils.validation_utils import validate_variable_filters
+from user_management_module.utils.user_utils import check_is_admin
 from llm_inference_config_module.container import LlmInferenceConfigContainer
 from llm_inference_config_module.services.llm_inference_config_service import (
     LlmInferenceConfigService,
 )
 
 async_router = APIRouter()
+
+_SHOW_ERROR_DESCRIPTION = (
+    'Return the stored error text instead of a generic message. Honoured for '
+    'admin callers only; everyone else gets the generic message regardless.'
+)
+
+# Params under this prefix filter the stored `variables`, not a column. The
+# prefix is not decoration: variable names are the caller's own, so one may
+# collide with a real filter and a bare `?status=` could mean either.
+VARIABLE_FILTER_PREFIX = 'variable.'
+
+
+def _extract_variable_filters(request: Request) -> Dict[str, str]:
+    """Pull `variable.<key>=<value>` pairs out of the query string.
+
+    Read off the raw query string because the names are the caller's data, not
+    a fixed set FastAPI could declare as arguments. A repeated key collapses to
+    its last value, which under AND semantics is the only reading that can
+    match. A bare `?variable.=x` is kept as the empty key it strips to, so the
+    validator 400s it rather than answering a filtered request unfiltered.
+    """
+    return {
+        key[len(VARIABLE_FILTER_PREFIX) :]: value
+        for key, value in request.query_params.items()
+        if key.startswith(VARIABLE_FILTER_PREFIX)
+    }
+
+
+async def _may_see_error(request: Request, show_error: bool) -> bool:
+    """Both halves must hold: the caller asks, and the caller is an admin.
+
+    Asking is a query param, so on its own it gates nothing — anyone can set
+    it. The admin check is what actually restricts the disclosure; the param
+    keeps the error text out of the default payload even for admins, so it
+    can't reach a UI by accident.
+    """
+    if not show_error:
+        return False
+
+    session = getattr(request.state, 'session', None)
+    if session is None:
+        return False
+
+    return await check_is_admin(session.role_id)
 
 
 @async_router.post(
@@ -100,7 +146,7 @@ async def async_agent_inference(
         )
     except ValueError as e:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content=response_formatter.buildErrorResponse(str(e)),
         )
 
@@ -170,7 +216,7 @@ async def async_workflow_inference(
         )
     except ValueError as e:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content=response_formatter.buildErrorResponse(str(e)),
         )
 
@@ -189,7 +235,9 @@ async def async_workflow_inference(
 @async_router.get('/v1/agentic-executions/{execution_id}')
 @inject
 async def get_execution_status(
+    request: Request,
     execution_id: UUID,
+    show_error: bool = Query(False, description=_SHOW_ERROR_DESCRIPTION),
     async_agentic_execution_service: AsyncAgenticExecutionService = Depends(
         Provide[AgentsContainer.async_agentic_execution_service]
     ),
@@ -197,9 +245,11 @@ async def get_execution_status(
         Provide[CommonContainer.response_formatter]
     ),
 ):
+    include_error = await _may_see_error(request, show_error)
+
     try:
         result = await async_agentic_execution_service.get_execution_status(
-            execution_id
+            execution_id, include_error=include_error
         )
     except ValueError as e:
         return JSONResponse(
@@ -221,6 +271,7 @@ async def get_execution_status(
 @async_router.get('/v1/agentic-executions')
 @inject
 async def list_executions(
+    request: Request,
     entity_id: Optional[UUID] = Query(
         None, description='Filter by agent or workflow UUID'
     ),
@@ -232,6 +283,7 @@ async def list_executions(
     ),
     offset: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
+    show_error: bool = Query(False, description=_SHOW_ERROR_DESCRIPTION),
     async_agentic_execution_service: AsyncAgenticExecutionService = Depends(
         Provide[AgentsContainer.async_agentic_execution_service]
     ),
@@ -239,12 +291,33 @@ async def list_executions(
         Provide[CommonContainer.response_formatter]
     ),
 ):
+    """List executions, newest first.
+
+    The run's stored `variables` are filtered with `?variable.<key>=<value>`,
+    and several AND together: an execution qualifies only if it carries every
+    pair given. Being the caller's own names rather than a fixed set, these are
+    read off the raw query string and do not appear in the OpenAPI schema.
+    """
+    include_error = await _may_see_error(request, show_error)
+
+    # Rejected before the query: an unusable filter is a 400, not an empty page
+    # that reads like a real answer.
+    try:
+        variable_filters = validate_variable_filters(_extract_variable_filters(request))
+    except ValueError as e:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=response_formatter.buildErrorResponse(str(e)),
+        )
+
     results, total = await async_agentic_execution_service.list_executions(
         entity_id=entity_id,
         entity_type=entity_type,
         status=execution_status,
+        variables=variable_filters or None,
         offset=offset,
         limit=limit,
+        include_error=include_error,
     )
 
     return JSONResponse(

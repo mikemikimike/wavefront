@@ -1,11 +1,17 @@
 from datetime import datetime
-import os
 import re
 from typing import Any, Tuple
 
 from common_module.log.logger import logger
 
-cloud_provider = os.environ.get('CLOUD_PROVIDER')
+
+def parameter_char_for_provider(provider: str | None) -> str:
+    """GCP OData uses ``@`` placeholders; every other platform uses ``:``."""
+    return '@' if (provider or '').lower() == 'gcp' else ':'
+
+
+def _dynamic_var_char(parameter: str | None = None) -> str:
+    return parameter or ':'
 
 
 def parse_value(value: str) -> Any:
@@ -52,6 +58,7 @@ def prepare_odata_filter(
 
     params = {}
     param_count = {}
+    dynamic_var_char = _dynamic_var_char(parameter)
 
     to_replace: list[Tuple[str, str]] = []
     for field, operator, value in matches:
@@ -65,10 +72,6 @@ def prepare_odata_filter(
         else:
             param_count[field] = 0
             param_key = f'{prefix}{field}'
-
-        dynamic_var_char = (
-            parameter if parameter else ('@' if cloud_provider == 'gcp' else ':')
-        )
 
         if operator == 'contains':
             parsed_value = parse_value(value)
@@ -100,16 +103,19 @@ def prepare_odata_filter(
     return sql_expr, params
 
 
-def fill_odata_query(sql_expr: str, parameters: dict = {}) -> str:
+def fill_odata_query(
+    sql_expr: str, parameters: dict | None = None, parameter: str | None = None
+) -> str:
     output_sql = sql_expr
-    dynamic_var_char = '@' if cloud_provider == 'gcp' else ':'
+    parameters = parameters or {}
+    dynamic_var_char = _dynamic_var_char(parameter)
     param_names = sorted(parameters.keys(), key=len, reverse=True)
     for parameter in param_names:
         if isinstance(parameters[parameter], str):
             output_sql = output_sql.replace(
                 f'{dynamic_var_char}{parameter}', f"'{parameters[parameter]}'"
             )
-        if isinstance(parameters[parameter], int):
+        elif isinstance(parameters[parameter], int):
             output_sql = output_sql.replace(
                 f'{dynamic_var_char}{parameter}', str(parameters[parameter])
             )

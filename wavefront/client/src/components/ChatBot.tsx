@@ -1,18 +1,16 @@
 import { Button } from '@app/components/ui/button';
-import { Label } from '@app/components/ui/label';
-import { Switch } from '@app/components/ui/switch';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@app/components/ui/select';
 import { Spinner } from '@app/components/ui/spinner';
 import { Textarea } from '@app/components/ui/textarea';
 import { Popover, PopoverContent, PopoverTrigger } from '@app/components/ui/popover';
+import { DOCUMENT_ACCEPT_ATTRIBUTE, IMAGE_ACCEPT_ATTRIBUTE } from '@app/constants/upload';
 import { LLMInferenceConfig } from '@app/types/llm-inference-config';
 import { ChatMessageContent, ImageContent, DocumentContent } from '@app/types/chat-message';
 import clsx from 'clsx';
-import { ChevronDown, Plus, X } from 'lucide-react';
+import { ChevronDown, FileText, Plus, X } from 'lucide-react';
 import React, { useRef, useState, type RefObject } from 'react';
-import Stream from './Stream';
+import Stream, { type StreamEvent } from './Stream';
 
-// Helper function to format file size
 const formatFileSize = (bytes: number): string => {
   const mb = bytes / (1024 * 1024);
   if (mb < 1) {
@@ -20,6 +18,48 @@ const formatFileSize = (bytes: number): string => {
     return `${kb.toFixed(2)} KB`;
   }
   return `${mb.toFixed(2)} MB`;
+};
+
+/** Shown in place of an empty reply bubble until the first token lands. */
+const TypingDots = () => (
+  <span className="flex items-center gap-1 py-1" aria-label="Agent is responding">
+    <span className="bg-frost-text-subtle h-1.5 w-1.5 animate-bounce rounded-full [animation-delay:0ms]" />
+    <span className="bg-frost-text-subtle h-1.5 w-1.5 animate-bounce rounded-full [animation-delay:150ms]" />
+    <span className="bg-frost-text-subtle h-1.5 w-1.5 animate-bounce rounded-full [animation-delay:300ms]" />
+  </span>
+);
+
+/** A turn's body: text as text, attachments as a compact chip. */
+const renderMessageContent = (content: ChatMessageContent) => {
+  if (typeof content === 'string') return content;
+
+  if (content !== null && typeof content === 'object' && 'image_base64' in content) {
+    const image = content as ImageContent;
+    return (
+      <span className="flex items-center gap-2">
+        <img
+          src={`data:${image.mime_type || 'image/png'};base64,${image.image_base64}`}
+          alt={image.file_name || 'Attached image'}
+          className="h-8 w-8 rounded object-cover"
+        />
+        <span className="max-w-40 truncate text-xs font-medium">{image.file_name || 'Image'}</span>
+      </span>
+    );
+  }
+
+  if (content !== null && typeof content === 'object' && 'document_type' in content) {
+    const document = content as DocumentContent;
+    return (
+      <span className="flex items-center gap-2">
+        <FileText className="h-4 w-4 shrink-0" />
+        <span className="max-w-50 truncate text-xs font-medium">
+          {document.metadata?.filename || document.file_name || 'Document'}
+        </span>
+      </span>
+    );
+  }
+
+  return <span className="font-mono text-xs">{JSON.stringify(content, null, 2)}</span>;
 };
 
 interface ChatBotProps {
@@ -40,7 +80,7 @@ interface ChatBotProps {
     base64: string;
     base64Content: string;
     mimeType: string;
-    documentType: 'pdf' | 'txt';
+    documentType: string;
   }>;
   handleRemoveImage: (index: number) => void;
   handleRemoveDocument: (index: number) => void;
@@ -57,18 +97,8 @@ interface ChatBotProps {
   handleDocumentUpload: (event: React.ChangeEvent<HTMLInputElement>) => void;
   uploadingImage: boolean;
   uploadingDocument: boolean;
-  listenEventsEnabled?: boolean;
-  setListenEventsEnabled?: React.Dispatch<React.SetStateAction<boolean>>;
   isModelSwitchEnabled?: boolean;
-  streamingEvents?: Array<{
-    event_type: string;
-    timestamp: number;
-    node_name?: string;
-    node_type?: string;
-    execution_time?: number;
-    error?: string;
-    router_choice?: string;
-  }>;
+  streamingEvents?: StreamEvent[];
   isStreaming?: boolean;
   eventsContainerRef?: RefObject<HTMLDivElement | null>;
 }
@@ -97,15 +127,15 @@ const ChatBot = ({
   handleDocumentUpload,
   uploadingImage,
   uploadingDocument,
-  listenEventsEnabled,
-  setListenEventsEnabled,
   streamingEvents,
   isStreaming,
   eventsContainerRef,
   isModelSwitchEnabled = true,
 }: ChatBotProps) => {
   const variablesModalRef = useRef<HTMLDivElement>(null);
-  const [showLogic, setShowLogic] = useState(true);
+  // Collapsed by default: the reply is what people came for, and the timeline
+  // is there when a run needs explaining.
+  const [showLogic, setShowLogic] = useState(false);
   const [selectValue, setSelectValue] = useState<string>('');
   const combinedAttachments = [
     ...uploadedImages.map((image, index) => ({ kind: 'image' as const, image, originalIndex: index })),
@@ -116,97 +146,65 @@ const ChatBot = ({
   const remainingCombinedAttachments = combinedAttachments.slice(2);
 
   return (
-    <div className="flex h-full w-full flex-col gap-7">
-      <div className="flex flex-col justify-between gap-2">
-        {listenEventsEnabled !== undefined && setListenEventsEnabled !== undefined && (
-          <div>
-            <div className="flex items-center justify-between">
-              <Label htmlFor="realtime-events-toggle" className="text-sm font-medium text-gray-700">
-                Real-time Events
-              </Label>
-              <Switch
-                id="realtime-events-toggle"
-                checked={listenEventsEnabled}
-                onCheckedChange={setListenEventsEnabled}
-              />
-            </div>
-            <p className="mt-1 text-xs text-gray-500">
-              {listenEventsEnabled ? 'Stream real-time workflow execution events' : 'Standard inference response only'}
-            </p>
-          </div>
-        )}
-      </div>
+    <div className="flex h-full w-full flex-col">
+      <div className="frost-panel ring-frost-border flex w-full flex-1 flex-col justify-between gap-2 rounded-xl border p-2 text-sm font-normal ring-1 outline-none">
+        <div id="message-container" className="frost-content h-full space-y-4 overflow-auto rounded-lg p-4">
+          {chatHistory.map((chat, index) => {
+            const isUser = chat.role === 'user';
+            // The reply currently being written: the placeholder bubble the
+            // page appends when a streamed run starts.
+            const isLive = Boolean(isStreaming) && !isUser && index === chatHistory.length - 1;
+            const isAwaitingFirstToken = isLive && chat.content === '';
 
-      <div className="flex w-full flex-1 flex-col justify-between gap-2 rounded-xl border border-[#EFF0F1] bg-[#FBFBFB] p-2 font-mono text-sm font-normal outline-none">
-        <div id="message-container" className="h-full space-y-4 overflow-auto bg-white p-4">
-          {chatHistory.map((chat, index) => (
-            <div key={index} className={`flex w-full ${chat.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className={clsx('flex max-w-[70%] flex-col', index % 2 === 0 ? 'items-end' : 'items-start')}>
-                <div
-                  className={clsx(
-                    'rounded-lg p-3 wrap-break-word break-all whitespace-pre-wrap',
-                    chat.role === 'user' ? 'bg-blue-100 text-blue-900' : 'bg-gray-100 text-gray-900'
-                  )}
-                >
-                  {typeof chat.content === 'string' ? (
-                    chat.content
-                  ) : typeof chat.content === 'object' && chat.content !== null && 'image_base64' in chat.content ? (
-                    <div className="flex items-center gap-2">
-                      <img
-                        src={`data:${(chat.content as ImageContent).mime_type || 'image/png'};base64,${(chat.content as ImageContent).image_base64}`}
-                        alt="Uploaded"
-                        className="h-4 w-4 rounded object-cover"
-                      />
-                      <p className="max-w-[120px] truncate text-[8px] font-medium text-gray-800">
-                        Image ({(chat.content as ImageContent).mime_type || 'unknown'})
-                      </p>
-                    </div>
-                  ) : typeof chat.content === 'object' && chat.content !== null && 'document_type' in chat.content ? (
-                    <div className="flex items-center gap-2">
-                      <span>📄</span>
-                      <span>{(chat.content as DocumentContent).metadata?.filename || 'Document'}</span>
-                    </div>
-                  ) : (
-                    JSON.stringify(chat.content, null, 2)
-                  )}
-                </div>
-                <p className={`mt-1 text-[8px] text-gray-500 ${chat.role === 'user' ? 'text-right' : 'text-left'}`}>
-                  {chat.role === 'user' ? 'You' : 'Agent'}
-                </p>
-              </div>
-            </div>
-          ))}
-          {listenEventsEnabled &&
-            ((streamingEvents && streamingEvents.length > 0) || (chatHistory && chatHistory.length > 0)) && (
-              <div className="mt-2">
-                <button
-                  type="button"
-                  onClick={() => setShowLogic(!showLogic)}
-                  className="flex w-full items-center justify-between rounded-md bg-gray-200 p-1 text-xs font-medium"
-                >
-                  <p className="text-xs font-medium">{showLogic ? 'Hide events' : 'Show events'}</p>
-                  <div className={clsx(showLogic ? 'rotate-180' : '')}>
-                    <ChevronDown />
+            return (
+              <div key={index} className={clsx('flex w-full', isUser ? 'justify-end' : 'justify-start')}>
+                <div className={clsx('flex flex-col', isUser ? 'max-w-[75%] items-end' : 'max-w-[85%] items-start')}>
+                  <div
+                    className={clsx(
+                      'rounded-xl px-3.5 py-2.5 leading-relaxed wrap-break-word whitespace-pre-wrap',
+                      isUser
+                        ? 'bg-brand/15 text-brand ring-brand/25 ring-1'
+                        : 'frost-glass-strong frost-text ring-frost-border ring-1'
+                    )}
+                  >
+                    {isAwaitingFirstToken ? <TypingDots /> : renderMessageContent(chat.content)}
+                    {isLive && !isAwaitingFirstToken && (
+                      <span className="bg-frost-text-muted ml-0.5 inline-block h-3.5 w-[3px] translate-y-[3px] animate-pulse rounded-[1px]" />
+                    )}
                   </div>
-                </button>
-                {showLogic && streamingEvents && streamingEvents.length > 0 && (
-                  <Stream
-                    listenEventsEnabled={listenEventsEnabled}
-                    streamingEvents={streamingEvents}
-                    isStreaming={isStreaming}
-                    eventsContainerRef={eventsContainerRef}
-                  />
-                )}
+                  <p className="frost-text-subtle mt-1 text-[10px]">{isUser ? 'You' : 'Agent'}</p>
+                </div>
               </div>
-            )}
-          {runningInference && (
+            );
+          })}
+          {streamingEvents && streamingEvents.length > 0 && (
+            <div>
+              <button
+                type="button"
+                onClick={() => setShowLogic(!showLogic)}
+                className="frost-text-muted hover:text-frost-text inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs font-medium transition-colors"
+              >
+                <ChevronDown className={clsx('h-3.5 w-3.5 transition-transform', showLogic && 'rotate-180')} />
+                {showLogic ? 'Hide run details' : `Run details (${streamingEvents.length})`}
+              </button>
+              {showLogic && (
+                <Stream
+                  streamingEvents={streamingEvents}
+                  isStreaming={isStreaming}
+                  eventsContainerRef={eventsContainerRef}
+                />
+              )}
+            </div>
+          )}
+          {/* A streamed run shows its own progress in the bubble, so the
+              generic spinner would be a second, redundant indicator. */}
+          {runningInference && !isStreaming && (
             <div className="flex w-max">
               <Spinner />
             </div>
           )}
         </div>
-        <div className="flex items-center gap-2 border-gray-200 pt-2">
-          {/* Fixed Model Selection */}
+        <div className="border-frost-border flex items-center gap-2 border-t pt-2">
           {isModelSwitchEnabled && (
             <div className="w-max min-w-[150px] shrink-0">
               <Select
@@ -214,7 +212,7 @@ const ChatBot = ({
                 onValueChange={(value) => setSelectedLLMConfigId(value)}
                 disabled={loadingConfigs}
               >
-                <SelectTrigger className="h-auto w-full rounded-lg border border-[#EFF0F1] bg-white p-1 text-[10px] text-black outline-none">
+                <SelectTrigger className="frost-control frost-text ring-frost-border h-auto w-full rounded-lg border px-2 py-1.5 text-xs ring-1 outline-none">
                   <SelectValue placeholder="default model" />
                 </SelectTrigger>
                 <SelectContent>
@@ -228,7 +226,6 @@ const ChatBot = ({
             </div>
           )}
 
-          {/* Scrollable Attachments Container */}
           {(uploadedImages.length > 0 || uploadedDocuments.length > 0) && (
             <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2 overflow-x-auto">
               <div className="flex shrink-0 gap-2">
@@ -236,7 +233,7 @@ const ChatBot = ({
                   attachment.kind === 'image' ? (
                     <div
                       key={index}
-                      className="group relative flex items-center gap-1 rounded-lg border border-gray-200 bg-white p-1 transition-colors hover:border-gray-300"
+                      className="frost-control group ring-frost-border relative flex items-center gap-1 rounded-lg border p-1 ring-1 transition-colors hover:opacity-90"
                     >
                       <img
                         src={attachment.image.base64}
@@ -244,37 +241,37 @@ const ChatBot = ({
                         className="h-6 w-6 rounded object-cover"
                       />
                       <div className="flex flex-col">
-                        <p className="max-w-[120px] truncate text-[8px] font-medium text-gray-800">
+                        <p className="frost-text max-w-30 truncate text-[11px] font-medium">
                           {attachment.image.file.name}
                         </p>
-                        <p className="text-[8px] text-gray-500">{formatFileSize(attachment.image.file.size)}</p>
+                        <p className="frost-text-subtle text-[10px]">{formatFileSize(attachment.image.file.size)}</p>
                       </div>
                       <button
                         onClick={() => handleRemoveImage(attachment.originalIndex)}
-                        className="ml-2 text-red-500 transition-colors hover:text-red-700"
+                        className="ml-1 text-red-500 transition-colors hover:text-red-700"
                         title="Remove image"
                       >
-                        <X />
+                        <X className="h-3.5 w-3.5" />
                       </button>
                     </div>
                   ) : (
                     <div
                       key={index}
-                      className="group relative flex items-center gap-2 rounded-lg border border-gray-200 bg-white p-2 transition-colors hover:border-gray-300"
+                      className="frost-control group ring-frost-border relative flex items-center gap-2 rounded-lg border p-2 ring-1 transition-colors hover:opacity-90"
                     >
-                      <div className="text-gray-600">📄</div>
+                      <FileText className="frost-text-muted h-4 w-4 shrink-0" />
                       <div className="flex flex-col">
-                        <p className="max-w-[120px] truncate text-[8px] font-medium text-gray-800">
+                        <p className="frost-text max-w-30 truncate text-[11px] font-medium">
                           {attachment.document.file.name}
                         </p>
-                        <p className="text-[8px] text-gray-500">{formatFileSize(attachment.document.file.size)}</p>
+                        <p className="frost-text-subtle text-[10px]">{formatFileSize(attachment.document.file.size)}</p>
                       </div>
                       <button
                         onClick={() => handleRemoveDocument(attachment.originalIndex)}
-                        className="ml-2 text-red-500 transition-colors hover:text-red-700"
+                        className="ml-1 text-red-500 transition-colors hover:text-red-700"
                         title="Remove document"
                       >
-                        <X />
+                        <X className="h-3.5 w-3.5" />
                       </button>
                     </div>
                   )
@@ -284,18 +281,18 @@ const ChatBot = ({
                     <PopoverTrigger asChild>
                       <button
                         type="button"
-                        className="flex cursor-pointer items-center rounded-lg border border-gray-200 bg-white px-2 text-xs font-medium text-gray-600 transition-colors hover:border-gray-300"
+                        className="frost-control frost-text-muted ring-frost-border hover:text-frost-text flex cursor-pointer items-center rounded-lg border px-2 text-xs font-medium ring-1 transition-colors"
                         title="Show remaining attachments"
                       >
                         +{remainingCombinedAttachmentsCount}
                       </button>
                     </PopoverTrigger>
-                    <PopoverContent align="start" className="w-64 bg-gray-800 p-2">
-                      <div className="b flex flex-col gap-1.5 opacity-80">
+                    <PopoverContent align="start" className="frost-glass-strong border-frost-border w-64 p-2">
+                      <div className="flex flex-col gap-1.5">
                         {remainingCombinedAttachments.map((attachment, index) => (
                           <p
                             key={`${attachment.kind}-${attachment.originalIndex}-${index}`}
-                            className="truncate text-xs text-white"
+                            className="frost-text truncate text-xs"
                           >
                             {attachment.kind === 'image' ? attachment.image.file.name : attachment.document.file.name}
                           </p>
@@ -313,7 +310,7 @@ const ChatBot = ({
           <input
             type="file"
             id="imageInput"
-            accept="image/*"
+            accept={IMAGE_ACCEPT_ATTRIBUTE}
             onChange={handleImageUpload}
             className="hidden"
             disabled={uploadingImage}
@@ -322,7 +319,7 @@ const ChatBot = ({
           <input
             type="file"
             id="documentInput"
-            accept=".pdf,.txt,application/pdf,text/plain"
+            accept={DOCUMENT_ACCEPT_ATTRIBUTE}
             onChange={handleDocumentUpload}
             className="hidden"
             disabled={uploadingDocument}
@@ -331,36 +328,31 @@ const ChatBot = ({
           {showVariablesInput && (
             <div
               ref={variablesModalRef}
-              className="absolute -top-[332px] left-0 z-20 flex w-96 flex-col gap-4 rounded-xl border border-[#EFF0F1] bg-white p-4 shadow-xl"
+              className="frost-card ring-frost-border absolute -top-[332px] left-0 z-20 flex w-96 flex-col gap-4 rounded-xl border p-4 ring-1"
             >
               <div className="flex items-center justify-between">
-                <label htmlFor="variables" className="text-base leading-normal font-normal text-[#282828]">
+                <label htmlFor="variables" className="frost-text text-base leading-normal font-normal">
                   Variables (JSON)
                 </label>
                 <button
                   onClick={() => setShowVariablesInput(false)}
-                  className="cursor-pointer text-gray-400 transition-colors hover:text-gray-600"
+                  className="frost-text-subtle hover:text-frost-text cursor-pointer transition-colors"
                 >
                   <X />
                 </button>
               </div>
-              <textarea
+              <Textarea
                 id="variables"
                 value={inferenceVariables}
                 onChange={(e) => setInferenceVariables(e.target.value)}
                 rows={5}
-                className="w-full rounded-lg border border-gray-300 bg-white p-3 font-mono text-sm text-[#282828] outline-none focus:text-black"
+                className="font-mono"
                 placeholder='{"key": "value"}'
               />
-              <p className="text-sm leading-normal font-normal text-[#878787]">
+              <p className="frost-text-muted text-sm leading-normal font-normal">
                 Define your variables in JSON format. Variables will be passed to the agent during inference.
               </p>
-              <Button
-                onClick={() => setShowVariablesInput(false)}
-                className="cursor-pointer rounded-xl bg-[#101010]! px-4 py-3 text-white!"
-              >
-                Done
-              </Button>
+              <Button onClick={() => setShowVariablesInput(false)}>Done</Button>
             </div>
           )}
           <div className="flex flex-col items-center justify-center">
@@ -380,7 +372,7 @@ const ChatBot = ({
               open={showUploadMenu}
               onOpenChange={setShowUploadMenu}
             >
-              <SelectTrigger className="inline-flex cursor-pointer rounded-md border-0 bg-transparent text-sm font-medium whitespace-nowrap text-gray-900 shadow-none ring-0 transition-all outline-none focus:ring-0 focus:outline-none focus-visible:ring-0 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-50 [&>span]:hidden [&>svg:last-child]:hidden">
+              <SelectTrigger className="frost-text inline-flex cursor-pointer rounded-md border-0 bg-transparent text-sm font-medium whitespace-nowrap shadow-none ring-0 transition-all outline-none focus:ring-0 focus:outline-none focus-visible:ring-0 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-50 [&>span]:hidden [&>svg:last-child]:hidden">
                 <Plus />
               </SelectTrigger>
               <SelectContent>
@@ -392,7 +384,7 @@ const ChatBot = ({
           </div>
 
           <div className="w-full">
-            <div className="flex w-full resize-none items-center justify-between rounded-lg border border-gray-300 bg-white p-2 text-sm text-[#282828] outline-none focus:text-black">
+            <div className="frost-control ring-frost-border flex w-full resize-none items-center justify-between rounded-lg border p-2 text-sm ring-1 outline-none">
               <Textarea
                 value={inferenceInput}
                 onChange={(e) => setInferenceInput(e.target.value)}
@@ -403,13 +395,13 @@ const ChatBot = ({
                   }
                 }}
                 rows={4}
-                className="flex-1 resize-none border-0 bg-transparent shadow-none outline-none focus-visible:ring-0"
+                className="flex-1 resize-none border-0 bg-transparent shadow-none ring-0 outline-none focus-visible:ring-0"
                 placeholder="Ask anything"
               />
               <button
                 type="button"
                 onClick={handleQuestionEntered}
-                className="h-max w-max rounded-full bg-blue-600 p-2 text-white hover:bg-blue-700"
+                className="bg-brand hover:bg-brand-hover h-max w-max rounded-full p-2 text-white"
               >
                 <svg className="h-4 w-4 rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path

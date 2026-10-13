@@ -1,6 +1,11 @@
 import uuid
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from agents_module.utils.validation_utils import (
+    validate_inference_inputs,
+    validate_inference_variables,
+)
 
 
 class AgentInferenceRequest(BaseModel):
@@ -8,20 +13,43 @@ class AgentInferenceRequest(BaseModel):
 
     variables: Dict[str, Any] | None = Field(
         default=None,
-        description='Variables to pass to the agent during inference',
-        example={
-            'target_language': 'Spanish',
-            'tone': 'formal',
-            'text_to_translate': 'Welcome to our application',
-        },
+        description=(
+            'Variables to pass to the agent during inference. Names and values '
+            'are restricted to letters, numbers, hyphens, underscores and '
+            'slashes; values may also contain spaces. At most 10 variables, '
+            'names up to 64 characters and values up to 500.'
+        ),
+        examples=[
+            {
+                'target_language': 'Spanish',
+                'tone': 'formal',
+                'text_to_translate': 'Welcome to our application',
+            }
+        ],
     )
+
+    # Validated on the model so every caller of this schema is covered — v1, v2
+    # and the async v3 endpoint alike — rather than per controller.
+    @field_validator('variables')
+    @classmethod
+    def check_variables(cls, v):
+        return validate_inference_variables(v)
+
     inputs: List[dict | str] | str = Field(
         ...,
         description='Inputs to use for inference',
-        example=[
-            'Translate the following text: <text_to_translate> to <target_language>'
+        examples=[
+            ['Translate the following text: <text_to_translate> to <target_language>']
         ],
     )
+
+    # Same rationale as check_variables: validated on the model so v1, v2 and the
+    # async v3 endpoint are all covered, since they share this schema.
+    @field_validator('inputs')
+    @classmethod
+    def check_inputs(cls, v):
+        return validate_inference_inputs(v)
+
     llm_inference_config_id: Optional[uuid.UUID] = Field(
         default=None,
         description="Optional ID of LLM inference configuration to override agent's default LLM",
@@ -33,7 +61,7 @@ class AgentInferenceRequest(BaseModel):
     tool_names: Optional[List[str]] = Field(
         default=None,
         description='Optional list of tool names to load and make available to the agent during inference',
-        example=['datasource_insert_rows', 'querying_knowlegebase'],
+        examples=[['datasource_insert_rows', 'send_email']],
     )
 
 
