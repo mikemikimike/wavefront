@@ -20,14 +20,7 @@ from tenacity import wait_exponential
 
 
 def _is_retryable_redis_error(exc: BaseException) -> bool:
-    """Whether a failed Redis call is worth attempting again.
-
-    Mirrors db_repo_module's CacheManager, which this class duplicates. OOM is
-    excluded because `maxmemory` is a standing refusal — the later attempts
-    fail for the same reason the first did, and the 1s/2s backoff between them
-    runs on the event loop (the cache endpoints and services call these
-    synchronously from async handlers).
-    """
+    """Retry everything except OOM, which fails the same way every time."""
     if isinstance(exc, OutOfMemoryError):
         return False
     return isinstance(exc, (RedisError, ConnectionError, TimeoutError))
@@ -223,19 +216,10 @@ class CacheManager:
             logger.error(f'Error getting key: {key} from cache: {e}')
             raise
 
-    # Batch size for both the SCAN cursor and the DEL argument list below.
     _INVALIDATE_BATCH = 500
 
     def invalidate_query(self, pattern: str) -> int:
-        """Remove all keys matching the given pattern.
-
-        SCAN rather than KEYS, matching db_repo_module's CacheManager. KEYS
-        walks the whole keyspace in one blocking call and returns every match
-        in a single reply, which is both a server stall and the client
-        output-buffer growth that `maxmemory-clients` now kills connections
-        over. Currently unreferenced in this app, but left correct so it is not
-        a trap for the first caller.
-        """
+        """Remove all keys matching the given pattern (SCAN, not KEYS)."""
         try:
             search_pattern = f'{self.namespace}/{pattern}'
             deleted = 0

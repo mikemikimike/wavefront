@@ -1,7 +1,4 @@
-"""Configuration of the publishing Celery app.
-
-No broker is contacted — constructing a Celery app is lazy.
-"""
+"""Configuration of the publishing Celery app. No broker is contacted."""
 
 import celery
 from dependency_injector import providers
@@ -14,13 +11,7 @@ BROKER = 'redis://localhost:6379/0'
 
 
 def test_does_not_become_the_current_app():
-    """Regression: Celery() defaults set_as_current=True.
-
-    TriggerEventProcessor reaches a publisher from inside the worker, so the
-    default replaced the worker's own app — which has the result backend, the
-    task `include` and the unacked_key transport overrides — with this bare
-    producer app, for the remaining life of the process.
-    """
+    """The default set_as_current=True replaced the worker's own app."""
     before = celery.current_app
 
     app = build_celery_client(broker_url=BROKER)
@@ -36,8 +27,6 @@ def test_publishes_to_the_hash_tagged_queue():
 
 
 def test_broker_socket_timeouts_are_set():
-    """Unset, redis-py blocks forever against a wedged broker — which would
-    hang the publish and the queue-depth probe rather than failing them."""
     options = build_celery_client(broker_url=BROKER).conf.broker_transport_options
 
     assert options['socket_timeout'] > 0
@@ -45,12 +34,7 @@ def test_broker_socket_timeouts_are_set():
 
 
 def test_broker_url_comes_from_the_argument(monkeypatch):
-    """The env var is cleared on purpose, and that is worth knowing about.
-
-    Celery resolves `CELERY_BROKER_URL` from the environment *in preference to*
-    the `broker=` argument, so wherever that variable is set it silently wins
-    over the `config.celery.broker_url` the containers pass in.
-    """
+    """A CELERY_BROKER_URL in the environment would win over the argument."""
     monkeypatch.delenv('CELERY_BROKER_URL', raising=False)
 
     app = build_celery_client(broker_url='redis://elsewhere:6380/2')
@@ -59,11 +43,6 @@ def test_broker_url_comes_from_the_argument(monkeypatch):
 
 
 def test_container_provides_one_app_per_process():
-    """One app means one broker connection pool.
-
-    This used to be an lru_cache on a module-level factory; it is the
-    container's Singleton now, so that is what has to hold.
-    """
     assert isinstance(AgentsContainer.celery_client, providers.Singleton)
 
 
@@ -101,8 +80,7 @@ def test_container_reads_the_knobs_from_the_celery_config_section():
 
 
 def test_container_defaults_the_knobs_an_ini_does_not_define():
-    """The celery worker's config.ini has broker_url and the socket timeout
-    only; the gate's knobs must default rather than fail the container."""
+    """The worker's ini defines only the socket timeout."""
     container = AgentsContainer()
     container.config.from_dict(
         {'celery': {'broker_url': BROKER, 'broker_socket_timeout_seconds': '4'}}

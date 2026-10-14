@@ -1,11 +1,4 @@
-"""A refused enqueue must cost nothing.
-
-create_and_enqueue_* uploads binary inputs to object storage and inserts a
-`pending` row before it publishes, so the guard has to sit ahead of both -
-otherwise a 429 leaves an orphan row and stored blobs behind for a request
-that never ran. No DB and no cloud storage here: both are MagicMock, which is
-the point - the assertions are that neither was touched.
-"""
+"""A refused enqueue must upload nothing and insert no row."""
 
 import base64
 import uuid
@@ -56,10 +49,7 @@ def has_capacity():
         yield guard
 
 
-# A real binary input, so the blob assertions below mean something. A plain
-# string would make them vacuous: pre_save_binary_inputs returns at its
-# `isinstance(inputs, str)` short-circuit and never reaches cloud storage, so
-# save_small_file would go uncalled whether the guard ran or not.
+# A binary input; a plain string never reaches cloud storage.
 PDF_B64 = base64.b64encode(b'%PDF-1.4 fake').decode('utf-8')
 
 BINARY_INPUTS = [
@@ -123,13 +113,7 @@ async def test_refusal_is_not_a_value_error(service, saturated, uuid4):
 
 
 async def test_worker_internal_callers_skip_the_guard(service, saturated, uuid4):
-    """enforce_queue_limit=False is how trigger event dispatch stays alive.
-
-    That path runs inside the worker on an event already gated at the webhook.
-    _handle_single_event would catch a refusal and mark the trigger event row
-    failed with processed_at set, and CELERY_TASK_MAX_RETRIES defaults to 0 -
-    so refusing there loses the work instead of deferring it.
-    """
+    """Inside the worker a refusal would lose already-admitted work."""
     service.celery.send_task.return_value.id = 'task-1'
 
     await service.create_and_enqueue_agent(
@@ -141,12 +125,6 @@ async def test_worker_internal_callers_skip_the_guard(service, saturated, uuid4)
 
 
 async def test_enqueue_proceeds_when_there_is_capacity(service, has_capacity, uuid4):
-    """The control for the assertions above.
-
-    Same inputs, capacity available: the blob *is* written and the row *is*
-    inserted. Without this, `assert_not_called` on the refusal path could pass
-    for reasons unrelated to the guard.
-    """
     service.celery.send_task.return_value.id = 'task-1'
 
     result = await service.create_and_enqueue_agent(agent_id=uuid4, **AGENT_KWARGS)

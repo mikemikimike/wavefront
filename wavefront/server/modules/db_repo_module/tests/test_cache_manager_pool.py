@@ -97,12 +97,7 @@ def test_empty_password_becomes_none():
 
 
 def test_out_of_memory_is_not_retried(monkeypatch):
-    """OOM is a standing refusal, so the retries cannot succeed.
-
-    They are not free either: these methods are sync redis-py called from
-    async code, so the exponential backoff between attempts stalls the event
-    loop. Matters now that the Redis instances run with a hard `maxmemory`.
-    """
+    """OOM fails the same way every time; retrying only blocks the event loop."""
     manager = make_manager()
     calls = []
 
@@ -119,15 +114,7 @@ def test_out_of_memory_is_not_retried(monkeypatch):
 
 
 def test_connection_errors_are_still_retried(monkeypatch):
-    """The OOM carve-out must not disarm retries for transient failures.
-
-    Note the asymmetry in what reaches the caller: the decorators do not set
-    reraise, so an exhausted retry surfaces as tenacity's RetryError, whereas
-    a refused retry (OOM, above) raises the Redis error itself. The OOM path is
-    the more useful of the two - OutOfMemoryError is a RedisError, so an
-    `except RedisError` handler catches it, which RetryError would have
-    escaped.
-    """
+    """An exhausted retry raises RetryError, unlike the OOM path above."""
     manager = make_manager()
     monkeypatch.setattr(module.time, 'sleep', lambda seconds: None)
     calls = []
@@ -145,8 +132,7 @@ def test_connection_errors_are_still_retried(monkeypatch):
 
 
 def test_oom_predicate_discriminates():
-    # RedisTimeoutError, not the builtin: cache_manager shadows TimeoutError
-    # with redis's, and only redis's is a RedisError.
+    # redis's TimeoutError, not the builtin.
     assert module._is_retryable_redis_error(ConnectionError('dropped')) is True
     assert module._is_retryable_redis_error(RedisTimeoutError('slow')) is True
     assert module._is_retryable_redis_error(RedisError('other')) is True
@@ -154,11 +140,6 @@ def test_oom_predicate_discriminates():
 
 
 def test_invalidate_query_scans_instead_of_using_keys(monkeypatch):
-    """KEYS blocks the server and returns every match in one reply.
-
-    On a keyspace sized near `maxmemory` that reply is also what
-    `maxmemory-clients` kills the connection over, mid-invalidation.
-    """
     manager = make_manager()
     scanned = {}
     deleted = []
@@ -176,7 +157,6 @@ def test_invalidate_query_scans_instead_of_using_keys(monkeypatch):
 
     assert manager.invalidate_query('agent_*') == 1203
     assert scanned['match'] == 'test/agent_*'
-    # Batched, so neither the reply nor the DEL argument list grows unbounded.
     assert [len(batch) for batch in deleted] == [500, 500, 203]
 
 

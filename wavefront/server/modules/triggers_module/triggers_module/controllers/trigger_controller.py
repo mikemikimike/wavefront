@@ -301,10 +301,6 @@ async def invoke_trigger(
             content=response_formatter.buildErrorResponse(str(exc)),
         )
     except QueueBackpressure as exc:
-        # Must precede the handler below, which would report a capacity limit
-        # as a 500. Either status makes Pub/Sub redeliver, but this one is not
-        # an error and says when to come back. Retry-After is for human and
-        # non-Pub/Sub callers; Pub/Sub uses its own backoff schedule.
         logger.warning(f'Trigger invoke refused for {trigger_id}: {exc}')
         return JSONResponse(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,

@@ -19,9 +19,7 @@ services:
     networks:
       - floware-network
 
-  # Shared by the Celery broker, the Celery result backend and the floware app
-  # cache. noeviction keeps Redis from dropping queued or unacked tasks under
-  # pressure.
+  # Celery broker and floware cache. noeviction so queued tasks are never evicted.
   redis:
     image: redis:7.4
     container_name: redis

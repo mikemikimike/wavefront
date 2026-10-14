@@ -1,8 +1,4 @@
-"""Queue-depth admission control for the Celery broker.
-
-No Redis server and no broker: the kombu channel is faked, so these assert the
-gate's decisions and the shape of the call it makes to measure depth.
-"""
+"""Queue-depth gate for the Celery broker. The kombu channel is faked."""
 
 import threading
 from collections import namedtuple
@@ -15,31 +11,19 @@ from agents_module.utils import celery_backpressure as bp
 from agents_module.utils.celery_backpressure import QueueBackpressure
 from agents_module.utils.celery_settings import CeleryProducerSettings
 
-#: The exception a real kombu ConnectionPool raises when nothing is free, taken
-#: off a real (lazily built, broker-less) app rather than imported from kombu —
-#: which is a transitive dependency nothing else in the repo imports directly.
-#: Using the genuine class is the point: it pins the translation in
-#: measure_queue_depth to what production will actually raise.
+# The real class a kombu ConnectionPool raises, without importing kombu.
 POOL_LIMIT_EXCEEDED = Celery('probe-test', set_as_current=False).pool.LimitExceeded
 
-# Mirrors kombu's queue_declare_ok_t, which is what the real queue_declare
-# returns; the gate reads .message_count off it.
+# Shape of kombu's queue_declare_ok_t.
 declare_ok = namedtuple(
     'queue_declare_ok_t', ('queue', 'message_count', 'consumer_count')
 )
 
-#: Stands in for the publishing app the gate is asked about. Tests that do
-#: not patch measure_queue_depth build a real fake with fake_app() instead.
 APP = MagicMock(name='celery_app')
 
 
 class _Knobs:
-    """The settings the gate is called with in the current test.
-
-    The gate takes its settings as an argument (they come from config.ini via
-    the container), so a test states the ones it cares about with `set` and
-    passes `KNOBS.settings` wherever the gate is called.
-    """
+    """Settings the gate is called with in the current test."""
 
     def __init__(self):
         self._values = {}
@@ -92,12 +76,7 @@ def test_measures_depth_through_queue_declare():
 
 
 def test_declares_the_hash_tagged_queue_non_passively():
-    """The key is literally `{celery}`, and passive would raise when empty.
-
-    kombu's Redis transport implements _has_queue as EXISTS over the priority
-    keys, so queue_declare(passive=True) raises ChannelError on an empty queue
-    - the normal case. Pin both the name and the absence of passive=True.
-    """
+    """The key is literally `{celery}`; passive=True raises on an empty queue."""
     app, channel = fake_app(0)
 
     bp.measure_queue_depth(app, KNOBS.settings)
@@ -107,14 +86,7 @@ def test_declares_the_hash_tagged_queue_non_passively():
 
 
 def test_acquires_with_a_timeout_and_releases():
-    """An unbounded acquire would park the probe on a busy pool forever.
-
-    app.connection_or_acquire() is pool.acquire(block=True) with timeout=None
-    against a broker_pool_limit of 10, and publishes draw on the same pool, so
-    the probe acquires with a timeout instead. `release` is the pool-aware
-    closure Resource.acquire attaches, so this returns the connection rather
-    than closing it.
-    """
+    """An unbounded acquire could park the probe behind publishes."""
     app, _channel = fake_app(0)
 
     bp.measure_queue_depth(app, KNOBS.settings)
@@ -135,13 +107,7 @@ def test_connection_is_released_even_when_the_probe_raises():
 
 
 def test_probe_makes_a_single_connection_attempt():
-    """A probe that cannot connect must fail now, not after kombu's retries.
-
-    `default_channel` on its own retries the connect with 2s then 4s sleeps
-    under a 4s budget: measured, a probe against a refused port took 6s to
-    fail. ensure_connection(max_retries=0) first makes that one attempt, and
-    is a no-op once connected.
-    """
+    """kombu otherwise retries the connect for ~6s."""
     app, _channel = fake_app(0)
     conn = app.pool.acquire.return_value
     calls = []
@@ -164,19 +130,12 @@ def exhausted_app():
 
 
 def test_pool_exhaustion_is_translated_not_leaked():
-    """An exhausted pool must be distinguishable from an unwell broker.
-
-    kombu's ConnectionPool inherits Resource._add_when_empty, which raises
-    self.LimitExceeded once _dirty is at the limit — so a probe that times out
-    waiting for a connection surfaces as ConnectionLimitExceeded. Left as-is it
-    would be logged as kombu's bare `LimitExceeded(10)`, which says nothing.
-    """
+    """kombu's own exception would log only the pool size."""
     app = exhausted_app()
 
     with pytest.raises(bp.BrokerPoolExhausted):
         bp.measure_queue_depth(app, KNOBS.settings)
 
-    # Nothing was acquired, so there is nothing to hand back.
     app.pool.acquire.return_value.release.assert_not_called()
 
 
@@ -208,11 +167,7 @@ async def test_refuses_above_the_limit(limit_10):
 
 
 async def test_backpressure_is_not_a_value_error(limit_10):
-    """The async inference controllers answer 422 on ValueError.
-
-    A transient capacity limit reported as a malformed request would be wrong
-    and would stop clients retrying.
-    """
+    """The controllers map ValueError to 422."""
     with patch.object(bp, 'measure_queue_depth', return_value=10):
         with pytest.raises(QueueBackpressure) as exc_info:
             await bp.ensure_queue_capacity(APP, KNOBS.settings)
@@ -237,12 +192,6 @@ async def test_non_positive_limit_disables_the_gate_without_probing(monkeypatch,
 
 @pytest.mark.parametrize('limit', [0, -1])
 def test_disabled_limit_does_not_divide_by_zero(monkeypatch, limit):
-    """_current_depth is reachable on its own, so the warn log must survive it.
-
-    With a non-positive limit the watermark test `depth >= limit * ratio` is
-    always true, which takes the percentage straight into a ZeroDivisionError.
-    queue_is_saturated returns before this, but nothing stops another caller.
-    """
     KNOBS.set(max_queue_depth=limit)
 
     with patch.object(bp, 'measure_queue_depth', return_value=5):
@@ -262,11 +211,6 @@ async def test_probe_failure_fails_open(limit_10, caplog):
 
 
 async def test_pool_exhaustion_is_just_another_failed_probe(limit_10, caplog):
-    """Our own pool being busy says nothing about the queue, so: admit.
-
-    And say why. The probe is the only acquirer with a timeout (send_task's is
-    unbounded), so under concurrent publishing it is the one that loses.
-    """
     with patch.object(
         bp,
         'measure_queue_depth',
@@ -276,16 +220,11 @@ async def test_pool_exhaustion_is_just_another_failed_probe(limit_10, caplog):
 
     assert 'no broker connection free' in caplog.text
 
-    # Nothing is paused by it: the very next call measures.
     with patch.object(bp, 'measure_queue_depth', return_value=12):
         assert await bp.queue_is_saturated(APP, KNOBS.settings) == (True, 12)
 
 
 # --- no new reading: answer from the last one -----------------------------
-#
-# One rule covers a failed probe and a probe another thread has in flight:
-# decide on the newest reading there is, while it is no more than
-# _MAX_STALENESS_SECONDS old.
 
 
 def blind_after(monkeypatch, depth):
@@ -299,11 +238,6 @@ def blind_after(monkeypatch, depth):
 
 
 async def test_a_failed_probe_does_not_forget_a_saturated_queue(limit_10, monkeypatch):
-    """The request whose own probe fails gets the same answer as everyone else.
-
-    It used to get None and be admitted, while callers a moment either side of
-    it were refused on the very reading it had just discarded.
-    """
     clock = blind_after(monkeypatch, depth=12)
     clock[0] += 5.0
 
@@ -316,10 +250,6 @@ async def test_a_failed_probe_does_not_forget_a_saturated_queue(limit_10, monkey
 
 
 async def test_an_outage_keeps_refusing_a_saturated_queue(limit_10, monkeypatch):
-    """Losing sight of a queue that was over the limit does not drain it.
-
-    So the gate must not flip to admitting because the broker went quiet.
-    """
     clock = blind_after(monkeypatch, depth=12)
     clock[0] += 2.0
 
@@ -327,8 +257,7 @@ async def test_an_outage_keeps_refusing_a_saturated_queue(limit_10, monkeypatch)
         for _ in range(6):
             assert await bp.queue_is_saturated(APP, KNOBS.settings) == (True, 12)
 
-    # No breaker: it goes on trying to measure, so it sees the recovery on
-    # the first call after the broker returns.
+    # Keeps probing, so it sees the recovery on the next call.
     assert probe.call_count == 6
 
 
@@ -344,11 +273,7 @@ async def test_an_outage_keeps_admitting_below_the_limit(limit_10, monkeypatch):
 async def test_a_reading_past_the_ceiling_stops_being_believed(
     limit_10, monkeypatch, caplog
 ):
-    """...in either direction, which is what makes believing it safe.
-
-    A broken probe in front of a healthy broker must not refuse work forever,
-    so past the ceiling a saturated reading is dropped and work is admitted.
-    """
+    """Otherwise a broken probe could refuse work forever."""
     clock = blind_after(monkeypatch, depth=12)
 
     with patch.object(bp, 'measure_queue_depth', side_effect=OSError('down')):
@@ -362,8 +287,7 @@ async def test_a_reading_past_the_ceiling_stops_being_believed(
             assert await bp.queue_is_saturated(APP, KNOBS.settings) == (False, None)
         await bp.ensure_queue_capacity(APP, KNOBS.settings)  # does not raise
 
-    # The gate being off is said out loud, once per window rather than once
-    # per request.
+    # Logged once per window, not once per request.
     assert caplog.text.count('enqueueing ungated') == 1
     assert 'last was 12' in caplog.text
 
@@ -371,11 +295,6 @@ async def test_a_reading_past_the_ceiling_stops_being_believed(
 async def test_an_outage_is_logged_once_and_so_is_the_recovery(
     limit_10, monkeypatch, caplog
 ):
-    """During an outage the probe fails on nearly every request.
-
-    One line per request would bury everything else, so the failure is logged
-    once per staleness window and the recovery once.
-    """
     clock = blind_after(monkeypatch, depth=12)
     clock[0] += 2.0
 
@@ -396,7 +315,7 @@ async def test_an_outage_is_logged_once_and_so_is_the_recovery(
         assert await bp.queue_is_saturated(APP, KNOBS.settings) == (False, 4)
     assert caplog.text.count('working again') == 1
 
-    # A second outage is announced at once, not swallowed by the first's window.
+    # A second outage is logged at once.
     clock[0] += 2.0
     with patch.object(bp, 'measure_queue_depth', side_effect=OSError('down again')):
         await bp.queue_is_saturated(APP, KNOBS.settings)
@@ -447,13 +366,7 @@ async def test_depth_is_remeasured_after_the_ttl(limit_10, monkeypatch):
 
 
 class HeldProbe:
-    """A probe stuck in flight, so the contended path can be tested exactly.
-
-    Sleeping and racing threads would make the assertions depend on 8 thread
-    starts landing inside a sleep window, which is not something a loaded CI
-    runner guarantees. This blocks the probe until the test releases it, so
-    "another caller is probing right now" is a fact rather than a hope.
-    """
+    """A probe that blocks until released, so contention is deterministic."""
 
     def __init__(self, depth):
         self.depth = depth
@@ -484,21 +397,13 @@ class HeldProbe:
 
 
 def test_callers_do_not_park_behind_an_in_flight_probe(limit_10, monkeypatch):
-    """One caller probes; the rest must not queue behind it.
-
-    _current_depth runs on the asyncio default thread pool, shared with binary
-    input uploads and every CacheManager call, so parking here would let a slow
-    broker starve work that has nothing to do with the broker.
-    """
     KNOBS.set(queue_depth_cache_ttl_seconds=60.0)
     probe = HeldProbe(4)
 
     with patch.object(bp, 'measure_queue_depth', side_effect=probe):
         thread, probed = probe.run_in_thread()
 
-        # The probe is in flight and holding the lock. These return at once
-        # instead of blocking, and on a cold cache they have nothing to serve,
-        # so they fail open.
+        # The probe holds the lock and there is no reading yet: admit at once.
         assert [bp._current_depth(APP, KNOBS.settings) for _ in range(7)] == [None] * 7
 
         probe.finish(thread)
@@ -526,13 +431,6 @@ def test_in_flight_probe_serves_the_previous_value(limit_10, monkeypatch):
 
 
 def test_a_wedged_probe_stops_being_believed(limit_10, monkeypatch):
-    """A probe that never returns must not freeze the gate forever.
-
-    A probe that hangs neither succeeds nor fails, so nothing replaces the
-    last reading and nothing is logged. Without a staleness ceiling it
-    would be served for the life of the process — the gate silently off if it
-    was under the limit, or a permanent 429 if it was over.
-    """
     KNOBS.set(queue_depth_cache_ttl_seconds=0.0)
     monkeypatch.setattr(bp, '_MAX_STALENESS_SECONDS', 30.0)
 
@@ -546,12 +444,10 @@ def test_a_wedged_probe_stops_being_believed(limit_10, monkeypatch):
     with patch.object(bp, 'measure_queue_depth', side_effect=probe):
         thread, _probed = probe.run_in_thread()
 
-        # Still within the ceiling: the stale reading is better than nothing.
         clock[0] += 29.0
         assert bp._current_depth(APP, KNOBS.settings) == 99
 
-        # Past it: stop refusing work on the strength of a reading nobody can
-        # refresh.
+        # Past the ceiling.
         clock[0] += 2.0
         assert bp._current_depth(APP, KNOBS.settings) is None
 
@@ -601,11 +497,7 @@ def test_config_strings_are_coerced():
 
 @pytest.mark.parametrize('raw', [None, '', '   ', 'not-a-number'])
 def test_unusable_config_values_fall_back_to_the_default(raw):
-    """A typo must not crash the server, nor silently disable the gate.
-
-    None is what the container passes for a key the ini does not define, as in
-    the celery worker, whose config.ini carries only the socket timeout.
-    """
+    """None is what the container passes for a key the ini lacks."""
     settings = CeleryProducerSettings(
         max_queue_depth=raw,
         queue_depth_cache_ttl_seconds=raw,

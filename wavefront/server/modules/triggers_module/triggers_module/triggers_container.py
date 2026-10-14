@@ -25,9 +25,6 @@ class TriggersContainer(containers.DeclarativeContainer):
 
     async_agentic_execution_service = providers.Dependency()
     cache_manager = providers.Dependency()
-    # The [celery] section of config.ini. A key the ini does not define (the
-    # celery worker's has only the socket timeout) arrives as None and takes
-    # the default.
     celery_settings = providers.Singleton(
         CeleryProducerSettings,
         max_queue_depth=config.celery.max_queue_depth,

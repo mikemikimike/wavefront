@@ -1,16 +1,4 @@
-"""The HTTP status a saturated queue produces, at both check points.
-
-The route functions are called directly with explicit arguments — FastAPI's
-`Depends(...)` are ordinary parameter defaults — so this needs no TestClient,
-no DI container and no database.
-
-The regression being pinned: the service re-checks capacity and raises
-QueueBackpressure, which is deliberately not a ValueError. The routes catch
-ValueError for their 422, so without an explicit handler the raise reaches
-floware's app-wide `@app.exception_handler(Exception)` and the caller gets a
-500 with no Retry-After — for the one condition this whole feature exists to
-report as a 429.
-"""
+"""A saturated queue answers 429, not 422 or 500, at both check points."""
 
 import uuid
 from unittest.mock import AsyncMock, MagicMock
@@ -41,7 +29,7 @@ def request_obj():
 def saturated_service():
     """A service whose enqueue refuses, as it does past the controller check."""
     service = MagicMock()
-    # The controller's own pre-check passes, so the service's raise is next.
+    # Passes the controller's pre-check; the service then raises.
     service.queue_is_saturated = AsyncMock(return_value=False)
     service.create_and_enqueue_agent = AsyncMock(
         side_effect=QueueBackpressure(10000, 10000, 45)
@@ -83,7 +71,6 @@ async def test_agent_route_answers_429_when_the_service_refuses(
     )
 
     assert response.status_code == 429
-    # The Retry-After the service raised with, i.e. the configured one.
     assert response.headers['retry-after'] == '45'
 
 
@@ -101,7 +88,6 @@ async def test_workflow_route_answers_429_when_the_service_refuses(
     )
 
     assert response.status_code == 429
-    # The Retry-After the service raised with, i.e. the configured one.
     assert response.headers['retry-after'] == '45'
 
 

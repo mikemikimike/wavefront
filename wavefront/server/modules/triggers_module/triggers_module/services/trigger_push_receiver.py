@@ -116,16 +116,8 @@ class TriggerPushReceiver:
             uuid.uuid4()
         )
 
-        # Raises QueueBackpressure, which the controller turns into a 429.
-        # Deliberately after signature verification and the cursor check, so an
-        # unverified caller cannot probe queue state and a 429 only ever goes
-        # to a push we would have accepted. Nothing above this has a side
-        # effect, so a refusal here costs nothing.
-        #
-        # A non-2xx is a nack: Pub/Sub redelivers with its own backoff, holding
-        # the event for the subscription's retention window. That makes the
-        # subscription a durable overflow buffer, which is why this refuses
-        # rather than dropping the event — a dropped push loses the email.
+        # After verification, so only an accepted push can get a 429. Pub/Sub
+        # redelivers a non-2xx, so the event is deferred, not lost.
         await ensure_queue_capacity(self._celery, self._celery_settings)
 
         self._celery.send_task(

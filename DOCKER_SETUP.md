@@ -177,9 +177,7 @@ adding one file there.
 | `REDIS_CALL_PROCESSING_MAXMEMORY` | Memory cap for `redis-call-processing`, a cache only (default: `512mb`) |
 | `REDIS_MAXMEMORY_CLIENTS` | Cap on client output buffers (default: `5%`) |
 
-The eviction policy is pinned to `noeviction` and is deliberately not
-configurable: anything else lets Redis silently delete queued Celery tasks or
-the keys that back rate limits and distributed locks.
+The eviction policy is fixed at `noeviction` so queued Celery tasks are never evicted.
 
 **Celery backpressure** (the enqueue path refuses work above a queue depth):
 
@@ -625,21 +623,17 @@ docker-compose exec redis-call-processing redis-cli
 - Check the memory limits: `docker-compose exec redis-floware redis-cli config get maxmemory maxmemory-policy`
 - Check headroom: `docker-compose exec redis-floware redis-cli info memory | grep -E 'used_memory_human|maxmemory_human'`
 
-If writes are failing with `OOM command not allowed`, Redis is at its
-`maxmemory` and refusing writes by design — reads still work. Raise
-`REDIS_MAXMEMORY`, or find what filled it with `redis-cli --bigkeys`.
+`OOM command not allowed` means Redis is at `maxmemory`; raise
+`REDIS_MAXMEMORY` or find what filled it with `redis-cli --bigkeys`.
 
 ### Celery Queue Issues
 
 - Queue depth: `docker-compose exec redis-floware redis-cli llen '{celery}'`
-- **Mind the quoting.** The queue key is literally `{celery}` (the braces are a
-  Redis Cluster hash tag, not a placeholder). `llen celery` reads a key that
-  does not exist and answers `0`.
+- The key is literally `{celery}`, quoted; `llen celery` always answers `0`.
 - All broker keys: `docker-compose exec redis-floware redis-cli --scan --pattern '{celery}*'`
 
-Inference endpoints returning `429` with a `Retry-After` header means the queue
-is at `CELERY_MAX_QUEUE_DEPTH` and the workers are not draining fast enough —
-scale the workers, or raise the limit if Redis has headroom.
+A `429` from the inference endpoints means the queue is at
+`CELERY_MAX_QUEUE_DEPTH`: scale the workers, or raise the limit.
 
 ### Port Conflicts
 

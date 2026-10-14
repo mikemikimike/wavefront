@@ -20,17 +20,7 @@ from tenacity import wait_exponential
 
 
 def _is_retryable_redis_error(exc: BaseException) -> bool:
-    """Whether a failed Redis call is worth attempting again.
-
-    Everything in RedisError except OOM is: a dropped socket or a timeout is
-    transient, and the retry is the point. OOM is not — `maxmemory` is a
-    standing refusal, so the second and third attempts fail for the same reason
-    the first did. They just aren't free: these methods are sync redis-py
-    called from async code, so the 1s/2s backoff between them stalls the whole
-    event loop rather than only the caller. Redis stays readable under
-    `maxmemory-policy noeviction`, so failing the write fast lets callers that
-    can proceed without the cache do so.
-    """
+    """Retry everything except OOM, which fails the same way every time."""
     if isinstance(exc, OutOfMemoryError):
         return False
     return isinstance(exc, (RedisError, ConnectionError, TimeoutError))
@@ -236,25 +226,10 @@ class CacheManager(CommonCache):
             logger.error(f'Error removing key: {key} from cache: {e}')
             raise
 
-    # Batch size for both the SCAN cursor and the DEL argument list below.
     _INVALIDATE_BATCH = 500
 
     def invalidate_query(self, pattern: str) -> int:
-        """Remove all keys matching the given pattern.
-
-        SCAN rather than KEYS. KEYS walks the entire keyspace in one blocking
-        call and returns every match in a single reply, which on a keyspace
-        sized anywhere near `maxmemory` is two problems at once: the server
-        stalls for the duration, and the reply accumulates in this client's
-        output buffer, where `maxmemory-clients` will eventually kill the
-        connection mid-invalidation. SCAN bounds both — the cursor keeps each
-        round trip short, and deleting per batch keeps the buffer flat.
-
-        The cost is that SCAN is not a point-in-time snapshot: keys written
-        after the cursor passed their slot survive. That is the right trade
-        here, because every caller is invalidating keys that were already
-        written before the invalidation started.
-        """
+        """Remove all keys matching the given pattern (SCAN, not KEYS)."""
         try:
             search_pattern = f'{self.namespace}/{pattern}'
             deleted = 0

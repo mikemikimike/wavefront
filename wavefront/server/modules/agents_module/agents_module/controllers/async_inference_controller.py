@@ -59,7 +59,6 @@ def _queue_saturated_json(
     response_formatter: ResponseFormatter,
     retry_after: int,
 ) -> JSONResponse:
-    """The 429 both saturation paths answer with."""
     return JSONResponse(
         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
         content=response_formatter.buildErrorResponse(
@@ -73,19 +72,7 @@ async def _queue_saturated_response(
     async_agentic_execution_service: AsyncAgenticExecutionService,
     response_formatter: ResponseFormatter,
 ) -> Optional[JSONResponse]:
-    """A 429 when the broker queue is over its limit, otherwise None.
-
-    Call this before anything with a side effect. These endpoints upload binary
-    inputs to object storage and insert a `pending` row before they enqueue, so
-    a refusal further down would leave an orphan row and stored blobs behind
-    for a request that never ran.
-
-    Returns a response rather than raising so the existing `except ValueError ->
-    422` blocks below stay untouched. The service re-checks and raises
-    QueueBackpressure for saturation that develops after this point, which each
-    route catches — see the enqueue calls below.
-    """
-    # The gate logs the refusal itself, with the depth and the reading's age.
+    """A 429 when the broker queue is over its limit, otherwise None."""
     if not await async_agentic_execution_service.queue_is_saturated():
         return None
 
@@ -148,9 +135,7 @@ async def async_agent_inference(
     # plus a stored blob and a failed execution.
     validate_inference_inputs_media(payload.inputs)
 
-    # After the media check so a payload that can never succeed still gets its
-    # 400 rather than a "retry later" it would retry forever, and before every
-    # I/O below: the version lookup, the blob upload and the pending row.
+    # Before any I/O, so a refusal leaves no blob or row behind.
     queue_full = await _queue_saturated_response(
         async_agentic_execution_service, response_formatter
     )
@@ -195,11 +180,7 @@ async def async_agent_inference(
             version=resolved_version,
         )
     except QueueBackpressure as e:
-        # The queue filled up between the check above and here — the version
-        # and llm-config lookups in between are I/O, easily longer than the
-        # depth cache's TTL. Without this the service's raise would reach the
-        # app-wide Exception handler as a 500, turning the capacity limit this
-        # feature exists to express into an unexpected error.
+        # The queue filled up after the pre-check above.
         logger.warning(f'Refusing inference at enqueue: {e}')
         return _queue_saturated_json(response_formatter, e.retry_after)
     except ValueError as e:
@@ -250,7 +231,6 @@ async def async_workflow_inference(
 
     validate_inference_inputs_media(payload.inputs)
 
-    # Same ordering as the agent route above.
     queue_full = await _queue_saturated_response(
         async_agentic_execution_service, response_formatter
     )
@@ -280,7 +260,6 @@ async def async_workflow_inference(
             version=workflow_data.get('version'),
         )
     except QueueBackpressure as e:
-        # See the agent route above.
         logger.warning(f'Refusing inference at enqueue: {e}')
         return _queue_saturated_json(response_formatter, e.retry_after)
     except ValueError as e:

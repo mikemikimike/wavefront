@@ -17,13 +17,8 @@ services:
     networks:
       - floware-network
 
-  # Shared by the Celery broker, the Celery result backend and the floware app
-  # cache. maxmemory is per-instance, not per-db, so all three draw on the same
-  # budget — and in production (Azure Managed Redis, single-db) they are not
-  # even on separate dbs. noeviction is what keeps Redis from dropping queued
-  # or unacked tasks under pressure: writes get refused, reads keep working,
-  # and the worker drains what is already queued. With no maxmemory at all it
-  # would instead grow until the OOM killer took the entire keyspace.
+  # Celery broker and floware cache. noeviction so queued tasks are never
+  # evicted; at the cap, writes fail and reads keep working.
   redis:
     image: redis:7.4
     container_name: redis
