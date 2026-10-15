@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 from typing import Any, Dict, Optional
 from uuid import UUID
@@ -120,7 +121,9 @@ class TriggerPushReceiver:
         # redelivers a non-2xx, so the event is deferred, not lost.
         await ensure_queue_capacity(self._celery, self._celery_settings)
 
-        self._celery.send_task(
+        # send_task is blocking redis-py.
+        await asyncio.to_thread(
+            self._celery.send_task,
             _TRIGGER_EVENT_TASK_NAME,
             kwargs={
                 'trigger_id': str(trigger_id),
