@@ -61,6 +61,7 @@ def limit_10(monkeypatch):
 def fake_app(depth):
     """A Celery app stand-in whose channel reports `depth` ready messages."""
     app = MagicMock()
+    app.conf.task_default_queue = '{celery}'
     channel = app.pool.acquire.return_value.default_channel
     channel.queue_declare.return_value = declare_ok('{celery}', depth, 0)
     return app, channel
@@ -83,6 +84,18 @@ def test_declares_the_hash_tagged_queue_non_passively():
 
     channel.queue_declare.assert_called_once_with(queue='{celery}')
     assert 'passive' not in channel.queue_declare.call_args.kwargs
+
+
+def test_measures_the_queue_the_client_publishes_to():
+    from agents_module.utils.celery_client import build_celery_client
+
+    real = build_celery_client('redis://localhost:6379/0', 'app2')
+    app, channel = fake_app(0)
+    app.conf.task_default_queue = real.conf.task_default_queue
+
+    bp.measure_queue_depth(app, KNOBS.settings)
+
+    channel.queue_declare.assert_called_once_with(queue='{app2}')
 
 
 def test_acquires_with_a_timeout_and_releases():

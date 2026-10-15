@@ -8,7 +8,6 @@ from typing import NamedTuple, Optional, Tuple
 from celery import Celery
 from common_module.log.logger import logger
 
-from agents_module.utils.celery_client import CELERY_QUEUE_NAME
 from agents_module.utils.celery_settings import (
     DEFAULT_BACKPRESSURE_RETRY_AFTER_SECONDS,
     CeleryProducerSettings,
@@ -55,12 +54,8 @@ _depth_lock = threading.Lock()
 _reading: Optional[_Reading] = None
 
 
-def measure_queue_depth(
-    app: Celery,
-    settings: CeleryProducerSettings,
-    queue: str = CELERY_QUEUE_NAME,
-) -> int:
-    """Ready tasks on `queue`, summed over its priority sub-keys. Blocking."""
+def measure_queue_depth(app: Celery, settings: CeleryProducerSettings) -> int:
+    """Ready tasks on the queue `app` publishes to. Blocking."""
     timeout = settings.broker_socket_timeout_seconds
     try:
         conn = app.pool.acquire(block=True, timeout=timeout)
@@ -72,6 +67,7 @@ def measure_queue_depth(
         # Single attempt; kombu otherwise retries the connect for ~6s.
         conn.ensure_connection(max_retries=0)
         # passive=True would raise on an empty queue.
+        queue = app.conf.task_default_queue
         return conn.default_channel.queue_declare(queue=queue).message_count
     finally:
         conn.release()

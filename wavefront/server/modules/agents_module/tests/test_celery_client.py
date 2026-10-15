@@ -4,7 +4,7 @@ import celery
 from dependency_injector import providers
 
 from agents_module.agents_container import AgentsContainer
-from agents_module.utils.celery_client import CELERY_QUEUE_NAME, build_celery_client
+from agents_module.utils.celery_client import build_celery_client
 from agents_module.utils.celery_settings import CeleryProducerSettings
 
 BROKER = 'redis://localhost:6379/0'
@@ -23,7 +23,6 @@ def test_does_not_become_the_current_app():
 def test_publishes_to_the_hash_tagged_queue():
     """Must match task_default_queue in celery_worker/celery_app.py."""
     assert build_celery_client(broker_url=BROKER).conf.task_default_queue == '{celery}'
-    assert CELERY_QUEUE_NAME == '{celery}'
 
 
 def test_broker_socket_timeouts_are_set():
@@ -49,7 +48,9 @@ def test_container_provides_one_app_per_process():
 def test_socket_timeout_comes_from_the_settings():
     settings = CeleryProducerSettings(broker_socket_timeout_seconds='0.5')
 
-    options = build_celery_client(BROKER, settings).conf.broker_transport_options
+    options = build_celery_client(
+        BROKER, settings=settings
+    ).conf.broker_transport_options
 
     assert options == {'socket_timeout': 0.5, 'socket_connect_timeout': 0.5}
 
@@ -89,3 +90,25 @@ def test_container_defaults_the_knobs_an_ini_does_not_define():
     assert container.celery_settings() == CeleryProducerSettings(
         broker_socket_timeout_seconds=4.0
     )
+
+
+def test_container_passes_queue_name_and_settings_together():
+    import celery
+
+    before = celery.current_app
+    container = AgentsContainer()
+    container.config.from_dict(
+        {
+            'celery': {
+                'broker_url': BROKER,
+                'queue_name': 'app2',
+                'broker_socket_timeout_seconds': '3.0',
+            }
+        }
+    )
+
+    app = container.celery_client()
+
+    assert app.conf.task_default_queue == '{app2}'
+    assert app.conf.broker_transport_options['socket_timeout'] == 3.0
+    assert celery.current_app is before

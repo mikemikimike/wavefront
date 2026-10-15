@@ -38,6 +38,7 @@ class TriggersContainer(containers.DeclarativeContainer):
     celery_client = providers.Singleton(
         build_celery_client,
         broker_url=config.celery.broker_url,
+        queue_name=config.celery.queue_name,
         settings=celery_settings,
     )
 
