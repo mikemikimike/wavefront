@@ -96,3 +96,19 @@ export interface VoiceAgentListData {
 export type VoiceAgentResponse = IApiResponse<VoiceAgentData>;
 export type VoiceAgentDetailResponse = IApiResponse<VoiceAgent>;
 export type VoiceAgentListResponse = IApiResponse<VoiceAgentListData>;
+
+/**
+ * Browser (WebRTC) voice room. `join_token` is one-time: it is shown once and the
+ * browser sends it with its SDP offer.
+ */
+export interface VoiceAgentRoom {
+  room_id: string;
+  voice_agent_id: string;
+  join_token: string;
+  /** Base URL of the signaling API (the browser POSTs `${signaling_url}/offer`). */
+  signaling_url: string;
+  /** True when `signaling_url` is a floware-relative path proxied to call_processing. */
+  signaling_via_floware?: boolean;
+}
+
+export type VoiceAgentRoomResponse = IApiResponse<VoiceAgentRoom>;

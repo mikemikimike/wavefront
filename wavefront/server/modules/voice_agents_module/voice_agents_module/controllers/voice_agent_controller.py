@@ -4,7 +4,7 @@ from uuid import UUID
 
 from dependency_injector.wiring import Provide, inject
 from fastapi import APIRouter, Depends, Path, Request, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from common_module.common_container import CommonContainer
 from common_module.log.logger import logger
@@ -20,6 +20,10 @@ from voice_agents_module.services.voice_agent_service import VoiceAgentService
 from voice_agents_module.services.twilio_service import TwilioService
 from voice_agents_module.services.exotel_service import ExotelService
 from voice_agents_module.services.smartflo_service import SmartfloService
+from voice_agents_module.services.webrtc_room_client import (
+    WebRTCRoomClient,
+    WebRTCRoomClientError,
+)
 from voice_agents_module.models.telephony_schemas import TelephonyProvider
 from voice_agents_module.voice_agents_container import VoiceAgentsContainer
 
@@ -565,3 +569,118 @@ async def get_welcome_audio_url(
                 f'Failed to generate welcome message URL: {str(e)}'
             ),
         )
+
+
+@voice_agent_router.post(
+    '/v1/voice-agents/{agent_id}/rooms', status_code=status.HTTP_201_CREATED
+)
+@inject
+async def create_webrtc_room(
+    agent_id: UUID = Path(..., description='The ID of the voice agent'),
+    response_formatter: ResponseFormatter = Depends(
+        Provide[CommonContainer.response_formatter]
+    ),
+    voice_agent_service: VoiceAgentService = Depends(
+        Provide[VoiceAgentsContainer.voice_agent_service]
+    ),
+    webrtc_room_client: WebRTCRoomClient = Depends(
+        Provide[VoiceAgentsContainer.webrtc_room_client]
+    ),
+):
+    """
+    Create a browser (WebRTC) voice room for an active voice agent.
+
+    Returns ``room_id``, ``voice_agent_id``, a one-time ``join_token`` (shown
+    once; the browser sends it with its SDP offer) and the ``signaling_url``
+    the browser should use. No outbound phone numbers are required.
+    """
+    agent_dict = await voice_agent_service.get_agent(agent_id)
+
+    if not agent_dict:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content=response_formatter.buildErrorResponse(
+                f'Voice agent not found with id: {agent_id}'
+            ),
+        )
+
+    if agent_dict.get('status') != 'active':
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=response_formatter.buildErrorResponse(
+                f'Voice agent must be active to start a browser call. Current status: {agent_dict.get("status")}'
+            ),
+        )
+
+    try:
+        room = await webrtc_room_client.create_room(agent_id)
+    except WebRTCRoomClientError as e:
+        return JSONResponse(
+            status_code=e.status_code,
+            content=response_formatter.buildErrorResponse(e.message),
+        )
+
+    return JSONResponse(
+        status_code=status.HTTP_201_CREATED,
+        content=response_formatter.buildSuccessResponse(room),
+    )
+
+
+async def _proxy_webrtc_signaling(
+    method: str,
+    request: Request,
+    response_formatter: ResponseFormatter,
+    webrtc_room_client: WebRTCRoomClient,
+) -> Response:
+    try:
+        proxied = await webrtc_room_client.forward_signaling(
+            method, await request.body(), request.headers.get('cookie')
+        )
+    except WebRTCRoomClientError as e:
+        return JSONResponse(
+            status_code=e.status_code,
+            content=response_formatter.buildErrorResponse(e.message),
+        )
+
+    response = Response(
+        content=proxied.content,
+        status_code=proxied.status_code,
+        media_type=proxied.media_type,
+    )
+    if proxied.set_cookie:
+        response.headers['set-cookie'] = proxied.set_cookie
+    return response
+
+
+@voice_agent_router.post('/v1/webrtc/offer')
+@inject
+async def proxy_webrtc_offer(
+    request: Request,
+    response_formatter: ResponseFormatter = Depends(
+        Provide[CommonContainer.response_formatter]
+    ),
+    webrtc_room_client: WebRTCRoomClient = Depends(
+        Provide[VoiceAgentsContainer.webrtc_room_client]
+    ),
+):
+    """SDP offer proxy to call_processing (only when signaling via floware is enabled)."""
+    return await _proxy_webrtc_signaling(
+        'POST', request, response_formatter, webrtc_room_client
+    )
+
+
+@voice_agent_router.patch('/v1/webrtc/offer')
+@inject
+async def proxy_webrtc_ice_candidates(
+    request: Request,
+    response_formatter: ResponseFormatter = Depends(
+        Provide[CommonContainer.response_formatter]
+    ),
+    webrtc_room_client: WebRTCRoomClient = Depends(
+        Provide[VoiceAgentsContainer.webrtc_room_client]
+    ),
+):
+    """Trickle ICE proxy to call_processing (only when signaling via floware is enabled)."""
+    return await _proxy_webrtc_signaling(
+        'PATCH', request, response_formatter, webrtc_room_client
+    )

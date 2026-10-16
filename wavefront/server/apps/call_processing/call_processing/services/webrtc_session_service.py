@@ -1,0 +1,314 @@
+"""Browser (WebRTC) sessions: signaling, peer-connection ownership and lifecycle.
+
+``SmallWebRTCRequestHandler`` / aiortc keep ``RTCPeerConnection`` state in this
+process, so a session is pinned to the instance that handled its offer. ICE
+(PATCH) and renegotiation must reach the same instance (sticky routing); Redis
+only holds the shared room metadata (see ``WebRTCRoomService``).
+
+Lifecycle of a session:
+    offer (token consumed) -> peer connects -> pipeline runs -> cleanup
+Cleanup always runs once, whether the client hung up, the connection never came
+up, the idle timeout fired, the max duration elapsed or the server is shutting
+down. It closes the peer connection and ends the room.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import socket
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+from uuid import UUID
+
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.transports.base_transport import TransportParams
+from pipecat.transports.smallwebrtc.connection import IceServer, SmallWebRTCConnection
+from pipecat.transports.smallwebrtc.request_handler import (
+    IceCandidate,
+    SmallWebRTCPatchRequest,
+    SmallWebRTCRequest,
+    SmallWebRTCRequestHandler,
+)
+from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+
+from call_processing.app_settings import CallProcessingAppSettings
+from call_processing.log.logger import logger
+from call_processing.services.audio_config import WEBRTC_PROVIDER
+from call_processing.services.pipecat_service import PipecatService
+from call_processing.services.voice_agent_cache_service import VoiceAgentCacheService
+from call_processing.services.webrtc_room_service import (
+    ERR_INVALID_JOIN_TOKEN,
+    ERR_STICKY_REQUIRED,
+    WebRTCRoomError,
+    WebRTCRoomService,
+    room_error,
+)
+
+# 5 minutes without speaking activity ends the session (Pipecat idle timeout)
+IDLE_TIMEOUT_SECS = 300
+
+
+@dataclass
+class OfferRequest:
+    sdp: str
+    type: str
+    pc_id: Optional[str] = None
+    restart_pc: Optional[bool] = None
+    room_id: Optional[str] = None
+    voice_agent_id: Optional[str] = None
+    join_token: Optional[str] = None
+
+
+@dataclass
+class _Session:
+    room_id: str
+    voice_agent_id: str
+    connection: SmallWebRTCConnection
+    connected: asyncio.Event = field(default_factory=asyncio.Event)
+    task: Optional[asyncio.Task] = None
+    cleaned_up: bool = False
+
+    @property
+    def pc_id(self) -> str:
+        return self.connection.pc_id
+
+
+class WebRTCSessionService:
+    def __init__(
+        self,
+        room_service: WebRTCRoomService,
+        voice_agent_cache_service: VoiceAgentCacheService,
+        app_settings: CallProcessingAppSettings,
+    ):
+        self.room_service = room_service
+        self.voice_agent_cache_service = voice_agent_cache_service
+        self.app_settings = app_settings
+        self.webrtc_settings = app_settings.webrtc
+
+        # Identifies this replica in the sticky cookie and on the room record
+        self.instance_id = f'{socket.gethostname()}-{uuid.uuid4().hex[:8]}'
+
+        ice_servers: List[IceServer] = [
+            IceServer(urls=url) for url in self.webrtc_settings.ice_servers
+        ]
+        self._handler = SmallWebRTCRequestHandler(ice_servers=ice_servers or None)
+        # pc_id -> session, only for peer connections owned by this process
+        self._sessions: Dict[str, _Session] = {}
+
+    # ------------------------------------------------------------------ signaling
+
+    async def handle_offer(self, offer: OfferRequest) -> Dict[str, str]:
+        """Handle the SDP offer. Returns the SDP answer (with ``pc_id``).
+
+        Raises ``WebRTCRoomError`` for join failures (invalid token, expired,
+        already joined, wrong instance).
+        """
+        request = SmallWebRTCRequest(
+            sdp=offer.sdp,
+            type=offer.type,
+            pc_id=offer.pc_id,
+            restart_pc=offer.restart_pc,
+        )
+
+        if offer.pc_id:
+            return await self._renegotiate(request, offer)
+
+        voice_agent_id = self._parse_agent_id(offer.voice_agent_id)
+
+        # Validates the token, rejects a double join, and consumes the token atomically
+        self.room_service.consume_join_token(
+            offer.room_id or '', voice_agent_id, offer.join_token
+        )
+        room_id = str(offer.room_id)
+
+        try:
+            configs = await self.voice_agent_cache_service.get_all_agent_configs(
+                UUID(voice_agent_id)
+            )
+
+            captured: Dict[str, SmallWebRTCConnection] = {}
+
+            async def on_connection(connection: SmallWebRTCConnection) -> None:
+                captured['connection'] = connection
+
+            answer = await self._handler.handle_web_request(request, on_connection)
+            connection = captured.get('connection')
+            if not answer or connection is None:
+                raise RuntimeError('WebRTC connection was not created')
+        except Exception:
+            # The token is spent; the client must create a new room
+            self.room_service.end_room(room_id)
+            raise
+
+        session = _Session(
+            room_id=room_id, voice_agent_id=voice_agent_id, connection=connection
+        )
+        self._sessions[session.pc_id] = session
+        self._watch_connection_state(session)
+        self.room_service.attach_connection(room_id, session.pc_id, self.instance_id)
+        session.task = asyncio.create_task(
+            self._run_session(session, configs), name=f'webrtc-session-{room_id}'
+        )
+        logger.info(
+            f'WebRTC session started room={room_id} pc_id={session.pc_id} '
+            f'instance={self.instance_id}'
+        )
+        return answer
+
+    async def _renegotiate(
+        self, request: SmallWebRTCRequest, offer: OfferRequest
+    ) -> Dict[str, str]:
+        session = self._sessions.get(offer.pc_id or '')
+        if session is None:
+            # Peer connections live in-process: this replica does not own it
+            raise WebRTCRoomError(
+                ERR_STICKY_REQUIRED,
+                409,
+                'This connection is handled by another instance',
+            )
+        if offer.room_id and offer.room_id != session.room_id:
+            raise room_error(ERR_INVALID_JOIN_TOKEN)
+
+        async def noop(_connection: SmallWebRTCConnection) -> None:
+            return None
+
+        answer = await self._handler.handle_web_request(request, noop)
+        return answer
+
+    async def handle_ice_candidates(
+        self, pc_id: str, candidates: List[IceCandidate]
+    ) -> None:
+        if pc_id not in self._sessions:
+            raise WebRTCRoomError(
+                ERR_STICKY_REQUIRED,
+                409,
+                'This connection is handled by another instance',
+            )
+        await self._handler.handle_patch_request(
+            SmallWebRTCPatchRequest(pc_id=pc_id, candidates=candidates)
+        )
+
+    # ------------------------------------------------------------------ lifecycle
+
+    def _watch_connection_state(self, session: _Session) -> None:
+        connection = session.connection
+
+        async def on_connected(_connection):
+            session.connected.set()
+
+        async def on_dead(_connection):
+            # Never connected (ICE failed / client left early): the pipeline is
+            # still waiting for a client, so stop it. Once connected, the
+            # transport's own disconnect handler ends the pipeline gracefully.
+            if (
+                not session.connected.is_set()
+                and not session.cleaned_up
+                and session.task
+            ):
+                session.task.cancel()
+
+        connection.add_event_handler('connected', on_connected)
+        connection.add_event_handler('failed', on_dead)
+        connection.add_event_handler('closed', on_dead)
+
+    async def _run_session(self, session: _Session, configs: Dict[str, Any]) -> None:
+        settings = self.webrtc_settings
+        watchdog = asyncio.create_task(self._connect_watchdog(session))
+        try:
+            transport = SmallWebRTCTransport(
+                webrtc_connection=session.connection,
+                params=TransportParams(
+                    audio_in_enabled=True,
+                    audio_out_enabled=True,
+                    vad_analyzer=SileroVADAnalyzer(
+                        params=VADParams(
+                            confidence=0.7,
+                            start_secs=0.2,
+                            stop_secs=0.2,
+                            min_volume=0.6,
+                        ),
+                    ),
+                ),
+            )
+            await asyncio.wait_for(
+                PipecatService(self.app_settings).run_conversation(
+                    transport=transport,
+                    agent_config=configs['agent'],
+                    llm_config=configs['llm_config'],
+                    tts_config=configs['tts_config'],
+                    stt_config=configs['stt_config'],
+                    tools=configs['tools'],
+                    customer_number='',
+                    call_id=session.room_id,
+                    agent_number='',
+                    provider=WEBRTC_PROVIDER,
+                    call_direction='inbound',
+                    audio_in_sample_rate=settings.sample_rate,
+                    audio_out_sample_rate=settings.sample_rate,
+                    idle_timeout_secs=IDLE_TIMEOUT_SECS,
+                ),
+                timeout=settings.max_session_secs,
+            )
+        except asyncio.TimeoutError:
+            logger.info(
+                f'WebRTC room {session.room_id} hit the {settings.max_session_secs}s '
+                'max session duration'
+            )
+        except asyncio.CancelledError:
+            logger.info(f'WebRTC session {session.room_id} cancelled')
+        except Exception as e:
+            logger.error(f'WebRTC session {session.room_id} failed: {e}', exc_info=True)
+        finally:
+            watchdog.cancel()
+            await self._cleanup(session)
+
+    async def _connect_watchdog(self, session: _Session) -> None:
+        """End sessions whose peer connection never comes up."""
+        timeout = self.webrtc_settings.connect_timeout_secs
+        try:
+            await asyncio.wait_for(session.connected.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f'WebRTC room {session.room_id} did not connect within {timeout}s'
+            )
+            if session.task:
+                session.task.cancel()
+        except asyncio.CancelledError:
+            pass
+
+    async def _cleanup(self, session: _Session) -> None:
+        if session.cleaned_up:
+            return
+        session.cleaned_up = True
+        self._sessions.pop(session.pc_id, None)
+        try:
+            await session.connection.disconnect()
+        except Exception as e:
+            logger.warning(f'Error closing WebRTC connection {session.pc_id}: {e}')
+        self.room_service.end_room(session.room_id)
+        logger.info(f'WebRTC session cleaned up room={session.room_id}')
+
+    async def close(self) -> None:
+        """Stop every session owned by this process (application shutdown)."""
+        sessions = list(self._sessions.values())
+        tasks = [s.task for s in sessions if s.task and not s.task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await self._handler.close()
+
+    # ------------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _parse_agent_id(voice_agent_id: Optional[str]) -> str:
+        try:
+            return str(UUID(str(voice_agent_id)))
+        except ValueError:
+            raise room_error(ERR_INVALID_JOIN_TOKEN)
+
+    @property
+    def active_sessions(self) -> int:
+        return len(self._sessions)

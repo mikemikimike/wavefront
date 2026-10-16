@@ -4,7 +4,7 @@ Pipecat pipeline orchestration service
 Creates and runs the voice conversation pipeline using configured STT/LLM/TTS services
 """
 
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from copy import deepcopy
 import asyncio
 import random
@@ -63,6 +63,19 @@ from pipecat.turns.user_stop import (
 from call_processing.services.stt_service import STTServiceFactory
 from call_processing.services.tts_service import TTSServiceFactory
 from call_processing.services.llm_service import LLMServiceFactory
+from call_processing.services.audio_config import (
+    TELEPHONY_SAMPLE_RATE,
+    WEBRTC_PROVIDER,
+    service_sample_rate,
+    with_sample_rate,
+)
+from call_processing.services.webrtc_app_messages import (
+    STATE_LISTENING,
+    STATE_SPEAKING,
+    STATE_THINKING,
+    BotCaptionProcessor,
+    BrowserSessionMessenger,
+)
 
 # from call_processing.services.conversation_completion_tool import (
 #     ConversationCompletionToolFactory,
@@ -114,10 +127,18 @@ class PipecatService:
         agent_number: str,
         provider: str,
         call_direction: str,
+        audio_in_sample_rate: int = TELEPHONY_SAMPLE_RATE,
+        audio_out_sample_rate: int = TELEPHONY_SAMPLE_RATE,
+        idle_timeout_secs: int = 300,
     ):
         """Create and run the Pipecat pipeline for a voice conversation.
 
         Args:
+            audio_in_sample_rate / audio_out_sample_rate: Pipeline audio rates.
+                Telephony is 8 kHz; for ``provider='webrtc'`` they are also
+                forced onto the STT/TTS services.
+            idle_timeout_secs: Cancel the pipeline after this long without
+                speaking activity.
             transport: Pipecat transport (e.g., WebSocket transport from Twilio)
             agent_config: Voice agent configuration including system_prompt,
                           supported_languages, default_language, tts_voice_id, tts_parameters, stt_parameters
@@ -176,6 +197,23 @@ class PipecatService:
             'region': stt_config.get('region'),
             'parameters': stt_parameters or {},
         }
+
+        # Browser (WebRTC) audio is wideband: force STT/TTS onto the pipeline rate
+        # so the telephony 8 kHz service defaults never leak into that path.
+        stt_config_with_params = with_sample_rate(
+            stt_config_with_params,
+            service_sample_rate(provider, audio_in_sample_rate),
+        )
+        tts_config_with_params = with_sample_rate(
+            tts_config_with_params,
+            service_sample_rate(provider, audio_out_sample_rate),
+        )
+        logger.info(
+            f'Audio sample rates for {provider} conversation: '
+            f'pipeline in={audio_in_sample_rate} out={audio_out_sample_rate}, '
+            f'stt={stt_config_with_params["parameters"].get("sample_rate", "service default")}, '
+            f'tts={tts_config_with_params["parameters"].get("sample_rate", "pipeline rate")}'
+        )
 
         if is_multi_language:
             logger.info(
@@ -404,6 +442,21 @@ class PipecatService:
         if is_multi_language:
             context_container['context'] = context
 
+        # Browser sessions only: app messages (set_context / interrupt) in and
+        # agent_state / caption / transcript events out. Bound to the task below.
+        browser_messenger: Optional[BrowserSessionMessenger] = None
+        if provider == WEBRTC_PROVIDER:
+            browser_messenger = BrowserSessionMessenger(
+                context=context,
+                function_schemas=all_function_schemas,
+                language_state=language_state,
+                always_allowed_tools=['detect_and_switch_language'],
+                supported_languages=supported_languages if is_multi_language else [],
+                tts_provider=tts_config['provider'],
+                stt_provider=stt_config['provider'],
+                tts_voice_ids=tts_voice_ids_dict,
+            )
+
         context_aggregator = LLMContextAggregatorPair(
             context,
             user_params=LLMUserAggregatorParams(
@@ -442,6 +495,8 @@ class PipecatService:
         async def on_user_turn_started(aggregator, strategy):
             if call_stats['_bot_speaking']:
                 call_stats['interruption_count'] += 1
+            if browser_messenger:
+                await browser_messenger.emit_agent_state(STATE_LISTENING)
 
         @context_aggregator.user().event_handler('on_user_turn_stopped')
         async def on_user_turn_stopped(
@@ -455,10 +510,15 @@ class PipecatService:
                     'timestamp': message.timestamp,
                 }
             )
+            if browser_messenger:
+                await browser_messenger.emit_transcript(message.content)
+                await browser_messenger.emit_agent_state(STATE_THINKING)
 
         @context_aggregator.assistant().event_handler('on_assistant_turn_started')
         async def on_assistant_turn_started(aggregator):
             call_stats['_bot_speaking'] = True
+            if browser_messenger:
+                await browser_messenger.emit_agent_state(STATE_SPEAKING)
 
         @context_aggregator.assistant().event_handler('on_assistant_turn_stopped')
         async def on_assistant_turn_stopped(
@@ -466,6 +526,8 @@ class PipecatService:
         ):
             call_stats['_bot_speaking'] = False
             call_stats['assistant_turns'] += 1
+            if browser_messenger:
+                await browser_messenger.emit_agent_state(STATE_LISTENING)
             transcript_log.append(
                 {
                     'role': 'assistant',
@@ -482,8 +544,13 @@ class PipecatService:
             llm,  # LLM processing
             tts,  # Text-to-Speech
             transport.output(),  # Audio output to Twilio
-            context_aggregator.assistant(),  # Add assistant response to context
         ]
+        if browser_messenger:
+            # After output so captions follow what the bot is actually saying
+            pipeline_components.append(BotCaptionProcessor(browser_messenger))
+        pipeline_components.append(
+            context_aggregator.assistant()  # Add assistant response to context
+        )
 
         # Create pipeline
         pipeline = Pipeline(pipeline_components)
@@ -499,8 +566,8 @@ class PipecatService:
         task = PipelineTask(
             pipeline,
             params=PipelineParams(
-                audio_in_sample_rate=8000,  # Twilio uses 8kHz
-                audio_out_sample_rate=8000,
+                audio_in_sample_rate=audio_in_sample_rate,  # 8kHz telephony, 16kHz WebRTC
+                audio_out_sample_rate=audio_out_sample_rate,
                 enable_metrics=True,
                 # enable_usage_metrics=True,
                 # report_only_initial_ttfb=True
@@ -511,7 +578,7 @@ class PipecatService:
                 BotStartedSpeakingFrame,
                 UserStartedSpeakingFrame,
             ),
-            idle_timeout_secs=300,
+            idle_timeout_secs=idle_timeout_secs,
             enable_tracing=pipecat_settings.enable_tracing,
             enable_turn_tracking=pipecat_settings.enable_turn_tracking,
             conversation_id=None,
@@ -528,6 +595,13 @@ class PipecatService:
 
         # Populate task container for language detection tool (if multi-language)
         task_container['task'] = task
+
+        if browser_messenger:
+            browser_messenger.bind_task(task)
+
+            @task.rtvi.event_handler('on_client_message')
+            async def on_client_message(rtvi, message):
+                await browser_messenger.handle_client_message(message)
 
         # Register event handlers
         @llm.event_handler('on_function_calls_started')

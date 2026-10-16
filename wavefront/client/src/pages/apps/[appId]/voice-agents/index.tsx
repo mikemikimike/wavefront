@@ -11,9 +11,10 @@ import { useNotifyStore } from '@app/store';
 import { VoiceAgent } from '@app/types/voice-agent';
 import { getLanguageName } from '@app/constants/languages';
 import { useQueryClient } from '@tanstack/react-query';
-import { Pencil, Phone, Trash2 } from 'lucide-react';
+import { Globe, Pencil, Phone, Trash2 } from 'lucide-react';
 import React, { useState } from 'react';
 import { useParams } from 'react-router';
+import BrowserCallDialog from './BrowserCallDialog';
 import CreateVoiceAgentDialog from './CreateVoiceAgentDialog';
 import EditVoiceAgentDialog from './EditVoiceAgentDialog';
 import OutboundCallDialog from './OutboundCallDialog';
@@ -29,6 +30,7 @@ const VoiceAgentsPage: React.FC = () => {
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [editItem, setEditItem] = useState<VoiceAgent | null>(null);
   const [callItem, setCallItem] = useState<VoiceAgent | null>(null);
+  const [browserCallItem, setBrowserCallItem] = useState<VoiceAgent | null>(null);
 
   // Fetch voice agents
   const { data: agents = [], isLoading: agentsLoading } = useGetVoiceAgents(app);
@@ -46,6 +48,11 @@ const VoiceAgentsPage: React.FC = () => {
   const handleCallClick = (e: React.MouseEvent, agent: VoiceAgent) => {
     e.stopPropagation();
     setCallItem(agent);
+  };
+
+  const handleBrowserCallClick = (e: React.MouseEvent, agent: VoiceAgent) => {
+    e.stopPropagation();
+    setBrowserCallItem(agent);
   };
 
   const handleEditSuccess = () => {
@@ -181,6 +188,16 @@ const VoiceAgentsPage: React.FC = () => {
                         <Button
                           variant="ghost"
                           size="sm"
+                          onClick={(e) => handleBrowserCallClick(e, agent)}
+                          title="Talk in browser"
+                        >
+                          <Globe className="h-4 w-4" />
+                        </Button>
+                      )}
+                      {agent.status === 'active' && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
                           onClick={(e) => handleCallClick(e, agent)}
                           title="Outbound Call"
                         >
@@ -233,6 +250,16 @@ const VoiceAgentsPage: React.FC = () => {
       {/* Outbound Call Dialog */}
       {app && callItem && (
         <OutboundCallDialog isOpen={!!callItem} onOpenChange={(open) => !open && setCallItem(null)} agent={callItem} />
+      )}
+
+      {/* Browser (WebRTC) Call Dialog */}
+      {app && browserCallItem && (
+        <BrowserCallDialog
+          isOpen={!!browserCallItem}
+          onOpenChange={(open) => !open && setBrowserCallItem(null)}
+          agent={browserCallItem}
+          appId={app}
+        />
       )}
     </div>
   );

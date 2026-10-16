@@ -8,6 +8,8 @@ import {
   VoiceAgentListData,
   VoiceAgentListResponse,
   VoiceAgentResponse,
+  VoiceAgentRoom,
+  VoiceAgentRoomResponse,
 } from '@app/types/voice-agent';
 import { AxiosInstance } from 'axios';
 
@@ -49,6 +51,14 @@ export class VoiceAgentService {
     data: { to_number: string; from_number?: string }
   ): Promise<IApiResponse<unknown>> {
     const response = await this.http.post(`/v1/:appId/floware/v1/voice-agents/${agentId}/initiate`, data);
+    return response;
+  }
+
+  /** Create a browser (WebRTC) room for an active voice agent. */
+  async createRoom(agentId: string): Promise<VoiceAgentRoomResponse> {
+    const response: IApiResponse<VoiceAgentRoom> = await this.http.post(
+      `/v1/:appId/floware/v1/voice-agents/${agentId}/rooms`
+    );
     return response;
   }
 }

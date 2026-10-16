@@ -71,8 +71,8 @@ class CacheManager:
                 a caller waits up to REDIS_POOL_TIMEOUT (2s) for one to be
                 released, then gets ConnectionError('No connection available.').
         """
-        if pool_size is None:
-            pool_size = 10
+        # config.ini values arrive as strings
+        pool_size = int(pool_size) if pool_size is not None else 10
         self.namespace = namespace
         self.redis_host = redis_host
         self.redis_port = int(redis_port)
@@ -242,6 +242,19 @@ class CacheManager:
             return bool(self.redis.delete(f'{self.namespace}/{key}'))
         except (RedisError, ConnectionError, TimeoutError) as e:
             logger.error(f'Error getting key: {key} from cache: {e}')
+            raise
+
+    def run_script(self, script: str, keys: list[str], args: list[Any]) -> Any:
+        """Run a Lua script atomically. ``keys`` are namespaced like every other key.
+
+        Used where a read-modify-write must not interleave (e.g. consuming a
+        one-time token).
+        """
+        try:
+            namespaced = [f'{self.namespace}/{key}' for key in keys]
+            return self.redis.eval(script, len(namespaced), *namespaced, *args)
+        except (RedisError, ConnectionError, TimeoutError) as e:
+            logger.error(f'Error running script on keys {keys}: {e}')
             raise
 
     def invalidate_query(self, pattern: str) -> int:
