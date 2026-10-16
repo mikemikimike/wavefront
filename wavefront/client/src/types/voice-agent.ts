@@ -109,6 +109,16 @@ export interface VoiceAgentRoom {
   signaling_url: string;
   /** True when `signaling_url` is a floware-relative path proxied to call_processing. */
   signaling_via_floware?: boolean;
+  /**
+   * Agents this room can run (the initial agent first). The server enforces the same list, so these are
+   * the only agents the browser may hot-swap to mid-session.
+   */
+  agents?: VoiceAgentRoomAgent[];
+}
+
+export interface VoiceAgentRoomAgent {
+  id: string;
+  name: string;
 }
 
 export type VoiceAgentRoomResponse = IApiResponse<VoiceAgentRoom>;

@@ -16,6 +16,7 @@ from call_processing.services.webrtc_app_messages import (
     build_step_overlay,
     filter_function_schemas,
     parse_set_context,
+    parse_switch_agent,
     strip_step_overlay,
 )
 
@@ -307,3 +308,136 @@ async def test_agent_state_dedupes_and_events_use_server_messages():
             'final': True,
         },
     ]
+
+
+# --------------------------------------------------------------- switch_agent
+
+
+def test_parse_switch_agent():
+    assert parse_switch_agent({'agent_id': ' abc '}) == 'abc'
+    assert parse_switch_agent({'agentId': 'abc'}) == 'abc'
+    for bad in (
+        None,
+        'abc',
+        [],
+        {},
+        {'agent_id': ''},
+        {'agent_id': '  '},
+        {'agent_id': 5},
+    ):
+        assert parse_switch_agent(bad) is None
+
+
+async def test_switch_agent_is_delegated_to_the_handler():
+    messenger, _, task = _messenger()
+    received = []
+
+    async def handler(agent_id):
+        received.append(agent_id)
+
+    messenger.set_switch_handler(handler)
+    await messenger.handle_client_message(_msg('switch_agent', {'agent_id': 'a-1'}))
+
+    assert received == ['a-1']
+    assert task.rtvi.sent == []
+
+
+async def test_switch_agent_bad_payload_is_rejected_without_calling_handler():
+    messenger, _, task = _messenger()
+    received = []
+
+    async def handler(agent_id):
+        received.append(agent_id)
+
+    messenger.set_switch_handler(handler)
+    await messenger.handle_client_message(_msg('switch_agent', {'agent_id': ''}))
+    await messenger.handle_client_message(_msg('switch_agent', 'nope'))
+
+    assert received == []
+    assert [m['code'] for m in task.rtvi.sent] == ['invalid_request'] * 2
+    assert all(m['type'] == 'agent_switch_failed' for m in task.rtvi.sent)
+
+
+async def test_switch_agent_without_handler_fails_cleanly():
+    messenger, _, task = _messenger()
+
+    await messenger.handle_client_message(_msg('switch_agent', {'agent_id': 'a-1'}))
+
+    assert task.rtvi.sent[0]['type'] == 'agent_switch_failed'
+    assert task.rtvi.sent[0]['code'] == 'swap_failed'
+
+
+async def test_switch_events_payloads():
+    messenger, _, task = _messenger()
+
+    await messenger.emit_agent_switching('a-2')
+    await messenger.emit_agent_changed('a-2', 'Second')
+
+    assert task.rtvi.sent == [
+        {'type': 'agent_switching', 'agent_id': 'a-2'},
+        {'type': 'agent_changed', 'agent_id': 'a-2', 'agent_name': 'Second'},
+    ]
+
+
+async def test_set_context_during_swap_is_deferred_and_applied_to_the_new_context():
+    messenger, old_context, task = _messenger()
+    await messenger.handle_client_message(
+        _msg('set_context', {'step': 'language', 'instruction': 'Ask language.'})
+    )
+    assert messenger.will_reopen_step()
+
+    messenger.begin_swap()
+    await messenger.handle_client_message(
+        _msg('set_context', {'step': 'identity', 'instruction': 'Ask name.'})
+    )
+    # The outgoing context is untouched while swapping
+    assert 'Ask name.' not in old_context.get_messages()[0]['content']
+
+    new_context = LLMContext([{'role': 'system', 'content': 'NEW PROMPT'}])
+    messenger.rebind(
+        context=new_context,
+        function_schemas=[_schema('tool_a')],
+        language_state={
+            'current_language': 'en',
+            'switch_count': 0,
+            'original_system_prompt': '',
+        },
+    )
+    await messenger.finish_swap()
+
+    system = new_context.get_messages()[0]['content']
+    assert system.startswith('NEW PROMPT') and 'Ask name.' in system
+    assert 'Ask language.' not in system
+    assert 'Ask name.' not in old_context.get_messages()[0]['content']
+
+
+async def test_finish_swap_reapplies_the_last_step_on_the_new_context():
+    messenger, _, _ = _messenger()
+    await messenger.handle_client_message(
+        _msg('set_context', {'step': 'identity', 'instruction': 'Ask name.'})
+    )
+
+    messenger.begin_swap()
+    new_context = LLMContext([{'role': 'system', 'content': 'NEW PROMPT'}])
+    messenger.rebind(
+        context=new_context,
+        function_schemas=[_schema('tool_a')],
+        language_state={
+            'current_language': 'en',
+            'switch_count': 0,
+            'original_system_prompt': '',
+        },
+    )
+    await messenger.finish_swap()
+
+    assert 'Ask name.' in new_context.get_messages()[0]['content']
+
+
+async def test_finish_swap_without_any_step_does_nothing():
+    messenger, _, task = _messenger()
+    messenger.begin_swap()
+    assert not messenger.will_reopen_step()
+
+    await messenger.finish_swap()
+
+    assert task.frames == []

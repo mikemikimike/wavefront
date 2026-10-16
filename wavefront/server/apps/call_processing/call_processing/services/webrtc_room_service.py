@@ -6,7 +6,11 @@ the plaintext is returned once, on creation.
 
 Room record (``webrtc_room:{room_id}``), JSON:
     voice_agent_id, join_token_hash, status (pending | joined | ended),
-    created_at, joined_at, pc_id, instance_id
+    created_at, joined_at, pc_id, instance_id,
+    allowed_agent_ids   agents the browser may hot-swap to (always includes
+                        ``voice_agent_id``); set by floware, never by the browser
+    active_voice_agent_id  the agent currently serving the room
+    swap_count          number of completed agent swaps
 
 Peer connections themselves are NOT stored here (aiortc state is in-process);
 ``pc_id`` / ``instance_id`` are kept for diagnostics and sticky-routing errors.
@@ -19,7 +23,7 @@ import secrets
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 from call_processing.cache.cache_manager import CacheManager
 from call_processing.log.logger import logger
@@ -33,6 +37,15 @@ ERR_INVALID_JOIN_TOKEN = 'invalid_join_token'
 ERR_ROOM_EXPIRED = 'room_expired'
 ERR_ROOM_ALREADY_JOINED = 'room_already_joined'
 ERR_STICKY_REQUIRED = 'sticky_required'
+
+# Stable error codes for a ``switch_agent`` request (sent as ``agent_switch_failed``)
+ERR_AGENT_NOT_ALLOWED = 'agent_not_allowed'
+ERR_AGENT_UNAVAILABLE = 'agent_unavailable'
+ERR_SWAP_IN_PROGRESS = 'swap_in_progress'
+ERR_SWAP_LIMIT_REACHED = 'swap_limit_reached'
+ERR_ALREADY_ACTIVE = 'already_active'
+ERR_SWAP_FAILED = 'swap_failed'
+ERR_INVALID_REQUEST = 'invalid_request'
 
 # Consume the join token: validate, flip pending -> joined, drop the token hash.
 # Runs atomically so two concurrent offers cannot both win.
@@ -77,6 +90,36 @@ room['pc_id'] = ARGV[1]
 room['instance_id'] = ARGV[2]
 redis.call('SET', KEYS[1], cjson.encode(room), 'KEEPTTL')
 return 1
+"""
+
+# Record a completed agent swap, keeping the room TTL. Refuses agents that are not
+# on the room's allowlist, so the record can never point outside it.
+# ARGV[1] agent_id
+# Returns {'ok', <swap_count>} or {'err', <code>}
+_RECORD_SWAP_SCRIPT = """
+local raw = redis.call('GET', KEYS[1])
+if not raw then
+    return {'err', 'room_expired'}
+end
+local room = cjson.decode(raw)
+if room['status'] ~= 'joined' then
+    return {'err', 'room_expired'}
+end
+local allowed = false
+if type(room['allowed_agent_ids']) == 'table' then
+    for _, id in ipairs(room['allowed_agent_ids']) do
+        if id == ARGV[1] then
+            allowed = true
+        end
+    end
+end
+if not allowed then
+    return {'err', 'agent_not_allowed'}
+end
+room['active_voice_agent_id'] = ARGV[1]
+room['swap_count'] = (tonumber(room['swap_count']) or 0) + 1
+redis.call('SET', KEYS[1], cjson.encode(room), 'KEEPTTL')
+return {'ok', room['swap_count']}
 """
 
 
@@ -128,12 +171,28 @@ class WebRTCRoomService:
     def _key(room_id: str) -> str:
         return f'webrtc_room:{room_id}'
 
-    def create_room(self, voice_agent_id: str) -> CreatedRoom:
-        """Create a pending room and mint its one-time join token."""
+    def create_room(
+        self,
+        voice_agent_id: str,
+        allowed_agent_ids: Optional[List[str]] = None,
+    ) -> CreatedRoom:
+        """Create a pending room and mint its one-time join token.
+
+        ``allowed_agent_ids`` is the set of agents the browser may hot-swap to.
+        The initial agent is always included; ``voice_agent_id`` itself never
+        changes (the join-token consume script depends on it).
+        """
         room_id = uuid.uuid4().hex
         join_token = secrets.token_urlsafe(32)
+        allowed = [voice_agent_id]
+        for agent_id in allowed_agent_ids or []:
+            if agent_id and agent_id not in allowed:
+                allowed.append(agent_id)
         record = {
             'voice_agent_id': voice_agent_id,
+            'allowed_agent_ids': allowed,
+            'active_voice_agent_id': voice_agent_id,
+            'swap_count': 0,
             'join_token_hash': hash_join_token(join_token),
             'status': ROOM_STATUS_PENDING,
             'created_at': time.time(),
@@ -180,6 +239,29 @@ class WebRTCRoomService:
         self.cache_manager.run_script(
             _ATTACH_SCRIPT, keys=[self._key(room_id)], args=[pc_id, instance_id]
         )
+
+    def record_swap(self, room_id: str, agent_id: str) -> Optional[int]:
+        """Record that the room now runs ``agent_id``. Returns the new swap count.
+
+        Returns None if the room is gone or ``agent_id`` is not allowed. Never
+        raises: the live session must not fail because bookkeeping did.
+        """
+        try:
+            result = self.cache_manager.run_script(
+                _RECORD_SWAP_SCRIPT, keys=[self._key(room_id)], args=[agent_id]
+            )
+        except Exception as e:
+            logger.warning(f'Failed to record swap for room {room_id}: {e}')
+            return None
+        if not result or result[0] != 'ok':
+            return None
+        return int(result[1])
+
+    def get_allowed_agent_ids(self, room_id: str) -> List[str]:
+        """The room's swap allowlist (empty if the room is gone)."""
+        room = self.get_room(room_id) or {}
+        allowed = room.get('allowed_agent_ids')
+        return [str(a) for a in allowed] if isinstance(allowed, list) else []
 
     def get_room(self, room_id: str) -> Optional[dict]:
         return self.cache_manager.get_json(self._key(room_id))

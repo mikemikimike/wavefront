@@ -6,12 +6,12 @@ import { Input } from '@app/components/ui/input';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@app/components/ui/table';
 import { useGetVoiceAgents } from '@app/hooks';
 import { getVoiceAgentsKey } from '@app/hooks/data/query-keys';
-import { extractErrorMessage } from '@app/lib/utils';
+import { copyToClipboard, extractErrorMessage } from '@app/lib/utils';
 import { useNotifyStore } from '@app/store';
 import { VoiceAgent } from '@app/types/voice-agent';
 import { getLanguageName } from '@app/constants/languages';
 import { useQueryClient } from '@tanstack/react-query';
-import { Globe, Pencil, Phone, Trash2 } from 'lucide-react';
+import { Copy, Globe, Pencil, Phone, Trash2 } from 'lucide-react';
 import React, { useState } from 'react';
 import { useParams } from 'react-router';
 import BrowserCallDialog from './BrowserCallDialog';
@@ -34,6 +34,15 @@ const VoiceAgentsPage: React.FC = () => {
 
   // Fetch voice agents
   const { data: agents = [], isLoading: agentsLoading } = useGetVoiceAgents(app);
+
+  const handleCopyId = async (id: string) => {
+    const copied = await copyToClipboard(id);
+    if (copied) {
+      notifySuccess('Copied ID to clipboard');
+    } else {
+      notifyError('Failed to copy ID');
+    }
+  };
 
   const handleDeleteClick = (e: React.MouseEvent, agent: VoiceAgent) => {
     e.stopPropagation();
@@ -139,6 +148,7 @@ const VoiceAgentsPage: React.FC = () => {
             <TableHeader>
               <TableRow>
                 <TableHead>Name</TableHead>
+                <TableHead>ID</TableHead>
                 <TableHead>Description</TableHead>
                 <TableHead>Inbound #s</TableHead>
                 <TableHead>Outbound #s</TableHead>
@@ -152,6 +162,16 @@ const VoiceAgentsPage: React.FC = () => {
               {filteredAgents.map((agent) => (
                 <TableRow key={agent.id}>
                   <TableCell className="font-medium">{agent.name}</TableCell>
+                  <TableCell className="max-w-[260px]" onClick={(e) => e.stopPropagation()}>
+                    <div className="flex items-center gap-1">
+                      <span className="truncate font-mono text-xs" title={agent.id}>
+                        {agent.id}
+                      </span>
+                      <Button variant="ghost" size="sm" title="Copy ID" onClick={() => void handleCopyId(agent.id)}>
+                        <Copy className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
+                  </TableCell>
                   <TableCell className="max-w-md truncate">{agent.description || '-'}</TableCell>
                   <TableCell>
                     <span className="frost-text-muted text-sm">{agent.inbound_numbers?.length || 0}</span>

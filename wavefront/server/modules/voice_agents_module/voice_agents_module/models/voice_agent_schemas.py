@@ -147,3 +147,14 @@ class InitiateCallPayload(BaseModel):
         None,
         description='Source phone number (optional, defaults to first configured number)',
     )
+
+
+class CreateWebRTCRoomPayload(BaseModel):
+    allowed_agent_ids: Optional[List[uuid.UUID]] = Field(
+        None,
+        description=(
+            'Narrow the agents this browser room may hot-swap to. Only active '
+            'agents ever qualify; this can remove agents, never add them. '
+            'Omit to allow every active agent.'
+        ),
+    )

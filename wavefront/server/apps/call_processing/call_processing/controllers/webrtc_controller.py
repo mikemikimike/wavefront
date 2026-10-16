@@ -40,6 +40,9 @@ AFFINITY_COOKIE = 'wf_webrtc_affinity'
 
 class CreateRoomRequest(BaseModel):
     voice_agent_id: UUID
+    # Agents the browser may hot-swap to mid-session. Decided by floware (the
+    # browser only ever holds the join token); the initial agent is always allowed.
+    allowed_agent_ids: Optional[List[UUID]] = None
 
 
 class OfferBody(BaseModel):
@@ -106,7 +109,10 @@ async def create_room(
     _auth: None = Depends(verify_passthrough_auth),
 ):
     """Create a room for a voice agent. The ``join_token`` is returned once."""
-    room = room_service.create_room(str(body.voice_agent_id))
+    room = room_service.create_room(
+        str(body.voice_agent_id),
+        allowed_agent_ids=[str(a) for a in body.allowed_agent_ids or []],
+    )
     return {
         'room_id': room.room_id,
         'voice_agent_id': room.voice_agent_id,

@@ -1,9 +1,10 @@
 import json
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 from dependency_injector.wiring import Provide, inject
-from fastapi import APIRouter, Depends, Path, Request, status
+from fastapi import APIRouter, Body, Depends, Path, Request, status
 from fastapi.responses import JSONResponse, Response
 
 from common_module.common_container import CommonContainer
@@ -11,6 +12,7 @@ from common_module.log.logger import logger
 from common_module.response_formatter import ResponseFormatter
 from voice_agents_module.models.voice_agent_schemas import (
     CreateVoiceAgentPayload,
+    CreateWebRTCRoomPayload,
     UpdateVoiceAgentPayload,
     VoiceAgentStatus,
     UNSET,
@@ -28,6 +30,39 @@ from voice_agents_module.models.telephony_schemas import TelephonyProvider
 from voice_agents_module.voice_agents_container import VoiceAgentsContainer
 
 voice_agent_router = APIRouter()
+
+# Upper bound on agents a browser room may switch between
+MAX_ROOM_SWITCHABLE_AGENTS = 20
+
+
+def _room_agent_choices(
+    initial_agent: Dict[str, Any],
+    all_agents: List[Dict[str, Any]],
+    narrow_to: Optional[List[UUID]],
+) -> List[Dict[str, str]]:
+    """The agents a browser room may hot-swap between, initial agent first.
+
+    Only active, non-deleted agents qualify. ``narrow_to`` (from the caller)
+    can only shrink the set, never add to it.
+    """
+    initial_id = str(initial_agent['id'])
+    wanted = {str(a) for a in narrow_to} if narrow_to is not None else None
+
+    choices = [{'id': initial_id, 'name': initial_agent.get('name') or ''}]
+    seen = {initial_id}
+    for agent in all_agents:
+        agent_id = str(agent.get('id'))
+        if agent_id in seen:
+            continue
+        if agent.get('status') != 'active' or agent.get('is_deleted'):
+            continue
+        if wanted is not None and agent_id not in wanted:
+            continue
+        seen.add(agent_id)
+        choices.append({'id': agent_id, 'name': agent.get('name') or ''})
+        if len(choices) >= MAX_ROOM_SWITCHABLE_AGENTS:
+            break
+    return choices
 
 
 @voice_agent_router.post('/v1/voice-agents')
@@ -347,7 +382,7 @@ async def initiate_call(
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
             content=response_formatter.buildErrorResponse(
-                f'Voice agent must be active to initiate calls. Current status: {agent_dict.get("status")}'
+                f"Voice agent must be active to initiate calls. Current status: {agent_dict.get('status')}"
             ),
         )
 
@@ -577,6 +612,7 @@ async def get_welcome_audio_url(
 @inject
 async def create_webrtc_room(
     agent_id: UUID = Path(..., description='The ID of the voice agent'),
+    payload: Optional[CreateWebRTCRoomPayload] = Body(default=None),
     response_formatter: ResponseFormatter = Depends(
         Provide[CommonContainer.response_formatter]
     ),
@@ -593,6 +629,11 @@ async def create_webrtc_room(
     Returns ``room_id``, ``voice_agent_id``, a one-time ``join_token`` (shown
     once; the browser sends it with its SDP offer) and the ``signaling_url``
     the browser should use. No outbound phone numbers are required.
+
+    The room can hot-swap to the other *active* agents: their ids are stored on
+    the room as an allowlist (the browser cannot add to it). The optional body
+    ``allowed_agent_ids`` narrows it. ``agents`` lists ``{id, name}`` of every
+    agent the room can run (the initial one first) for the client's picker.
     """
     agent_dict = await voice_agent_service.get_agent(agent_id)
 
@@ -608,18 +649,26 @@ async def create_webrtc_room(
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
             content=response_formatter.buildErrorResponse(
-                f'Voice agent must be active to start a browser call. Current status: {agent_dict.get("status")}'
+                f"Voice agent must be active to start a browser call. Current status: {agent_dict.get('status')}"
             ),
         )
 
+    all_agents = await voice_agent_service.list_agents()
+    agents = _room_agent_choices(
+        agent_dict, all_agents, payload.allowed_agent_ids if payload else None
+    )
+
     try:
-        room = await webrtc_room_client.create_room(agent_id)
+        room = await webrtc_room_client.create_room(
+            agent_id, allowed_agent_ids=[UUID(a['id']) for a in agents]
+        )
     except WebRTCRoomClientError as e:
         return JSONResponse(
             status_code=e.status_code,
             content=response_formatter.buildErrorResponse(e.message),
         )
 
+    room['agents'] = agents
     return JSONResponse(
         status_code=status.HTTP_201_CREATED,
         content=response_formatter.buildSuccessResponse(room),

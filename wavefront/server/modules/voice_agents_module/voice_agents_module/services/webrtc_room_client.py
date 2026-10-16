@@ -9,7 +9,7 @@ registry and the media. This client:
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 import flo_lib.http as httpx
@@ -56,8 +56,16 @@ class WebRTCRoomClient:
             )
         return self.call_processing_base_url
 
-    async def create_room(self, voice_agent_id: UUID) -> Dict[str, Any]:
+    async def create_room(
+        self,
+        voice_agent_id: UUID,
+        allowed_agent_ids: Optional[List[UUID]] = None,
+    ) -> Dict[str, Any]:
         """Create a room. Returns room_id, voice_agent_id, join_token, signaling_url.
+
+        ``allowed_agent_ids`` is the allowlist for hot-swapping the voice agent
+        mid-session (call_processing always adds the initial agent). Omit it for a
+        room that cannot switch agents.
 
         With ``signaling_via_floware`` the returned ``signaling_url`` is the
         floware-relative proxy path (and ``signaling_via_floware`` is true), so
@@ -69,11 +77,13 @@ class WebRTCRoomClient:
         if self.passthrough_secret:
             headers['X-Passthrough'] = self.passthrough_secret
 
+        body: Dict[str, Any] = {'voice_agent_id': str(voice_agent_id)}
+        if allowed_agent_ids is not None:
+            body['allowed_agent_ids'] = [str(a) for a in allowed_agent_ids]
+
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(
-                    url, json={'voice_agent_id': str(voice_agent_id)}, headers=headers
-                )
+                response = await client.post(url, json=body, headers=headers)
         except httpx.RequestError as e:
             logger.error(f'WebRTC room creation request failed: {e}')
             raise WebRTCRoomClientError('Voice service is unreachable', 502) from e

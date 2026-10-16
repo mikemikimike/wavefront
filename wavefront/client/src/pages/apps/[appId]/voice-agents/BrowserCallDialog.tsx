@@ -1,6 +1,7 @@
 import floConsoleService from '@app/api';
 import { Alert, AlertDescription, AlertTitle } from '@app/components/ui/alert';
 import { Button } from '@app/components/ui/button';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@app/components/ui/select';
 import {
   Dialog,
   DialogContent,
@@ -13,17 +14,26 @@ import { appEnv } from '@app/config/env';
 import { TOKEN_KEY } from '@app/lib/constants';
 import { extractErrorMessage } from '@app/lib/utils';
 import { useNotifyStore } from '@app/store';
-import { VoiceAgent, VoiceAgentRoom } from '@app/types/voice-agent';
+import { VoiceAgent, VoiceAgentRoom, VoiceAgentRoomAgent } from '@app/types/voice-agent';
 import { PipecatClient } from '@pipecat-ai/client-js';
 import { SmallWebRTCTransport } from '@pipecat-ai/small-webrtc-transport';
-import { AlertTriangle, Mic, MicOff, PhoneOff } from 'lucide-react';
+import { AlertTriangle, ArrowRightLeft, Mic, MicOff, PhoneOff } from 'lucide-react';
 import React, { useEffect, useRef, useState } from 'react';
-import { BrowserCallError, classifyBrowserCallError, describeBrowserCallError } from './browser-call-errors';
+import {
+  AgentSwitchError,
+  BrowserCallError,
+  classifyBrowserCallError,
+  describeAgentSwitchError,
+  describeBrowserCallError,
+  parseAgentSwitchMessage,
+} from './browser-call-errors';
 
 type CallStatus = 'idle' | 'connecting' | 'connected' | 'ended' | 'error';
 
 // The server gives up on a join that never completes after 60s; surface the failure a little sooner.
 const CONNECT_TIMEOUT_MS = 45_000;
+// The server aborts a swap after 15s; give up waiting a little later.
+const SWITCH_TIMEOUT_MS = 20_000;
 const ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
 
 interface BrowserCallDialogProps {
@@ -78,6 +88,12 @@ const BrowserCallDialog: React.FC<BrowserCallDialogProps> = ({ isOpen, onOpenCha
   const [status, setStatus] = useState<CallStatus>('idle');
   const [error, setError] = useState<BrowserCallError | null>(null);
   const [micEnabled, setMicEnabled] = useState(true);
+  // Agent hot-swap: the room's allowlist (initial agent first), who is talking now, and swap progress.
+  const [roomAgents, setRoomAgents] = useState<VoiceAgentRoomAgent[]>([]);
+  const [activeAgentId, setActiveAgentId] = useState<string>(agent.id);
+  const [selectedAgentId, setSelectedAgentId] = useState<string>('');
+  const [switchingToId, setSwitchingToId] = useState<string | null>(null);
+  const [switchError, setSwitchError] = useState<AgentSwitchError | null>(null);
 
   const clientRef = useRef<PipecatClient | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -85,10 +101,57 @@ const BrowserCallDialog: React.FC<BrowserCallDialogProps> = ({ isOpen, onOpenCha
   const attemptRef = useRef(0);
   // True only while a call is established, so late transport events can't clobber connecting/error states.
   const liveRef = useRef(false);
+  const switchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearSwitchTimer = () => {
+    if (switchTimerRef.current) clearTimeout(switchTimerRef.current);
+    switchTimerRef.current = null;
+  };
+
+  const resetSwitchState = () => {
+    clearSwitchTimer();
+    setSwitchingToId(null);
+    setSwitchError(null);
+    setSelectedAgentId('');
+  };
+
+  const showSwitchError = (switchErr: AgentSwitchError) => {
+    clearSwitchTimer();
+    setSwitchingToId(null);
+    setSwitchError(switchErr);
+    notifyError(switchErr.title);
+  };
+
+  const handleServerMessage = (attempt: number, data: unknown) => {
+    if (attempt !== attemptRef.current) return;
+    const message = parseAgentSwitchMessage(data);
+    if (!message) return;
+    switch (message.type) {
+      case 'agent_switching':
+        setSwitchError(null);
+        setSwitchingToId(message.agent_id);
+        break;
+      case 'agent_changed':
+        clearSwitchTimer();
+        setActiveAgentId(message.agent_id);
+        if (message.agent_name) {
+          const { agent_id, agent_name } = message;
+          setRoomAgents((current) => current.map((a) => (a.id === agent_id ? { ...a, name: agent_name } : a)));
+        }
+        setSwitchingToId(null);
+        setSwitchError(null);
+        setSelectedAgentId('');
+        break;
+      case 'agent_switch_failed':
+        showSwitchError(describeAgentSwitchError(message.code, message.message));
+        break;
+    }
+  };
 
   const teardown = async () => {
     attemptRef.current += 1;
     liveRef.current = false;
+    clearSwitchTimer();
     const client = clientRef.current;
     clientRef.current = null;
     if (audioRef.current) audioRef.current.srcObject = null;
@@ -106,6 +169,8 @@ const BrowserCallDialog: React.FC<BrowserCallDialogProps> = ({ isOpen, onOpenCha
     return () => {
       void teardown();
     };
+    // Unmount-only cleanup; teardown only touches refs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const fail = (attempt: number, callError: BrowserCallError, toast = true) => {
@@ -120,6 +185,9 @@ const BrowserCallDialog: React.FC<BrowserCallDialogProps> = ({ isOpen, onOpenCha
     const attempt = attemptRef.current;
     setError(null);
     setMicEnabled(true);
+    resetSwitchState();
+    setRoomAgents([]);
+    setActiveAgentId(agent.id);
     setStatus('connecting');
 
     let room: VoiceAgentRoom | undefined;
@@ -136,6 +204,8 @@ const BrowserCallDialog: React.FC<BrowserCallDialogProps> = ({ isOpen, onOpenCha
       fail(attempt, describeBrowserCallError('create_room_failed'));
       return;
     }
+    setRoomAgents(room.agents ?? []);
+    setActiveAgentId(room.voice_agent_id);
 
     const client = new PipecatClient({
       transport: new SmallWebRTCTransport({
@@ -158,6 +228,7 @@ const BrowserCallDialog: React.FC<BrowserCallDialogProps> = ({ isOpen, onOpenCha
           // (which bumps attemptRef first and is ignored above).
           if (liveRef.current) setStatus('ended');
         },
+        onServerMessage: (data: unknown) => handleServerMessage(attempt, data),
         onTransportStateChanged: (state) => {
           if (attempt !== attemptRef.current || state !== 'error') return;
           if (!liveRef.current) return;
@@ -198,17 +269,43 @@ const BrowserCallDialog: React.FC<BrowserCallDialogProps> = ({ isOpen, onOpenCha
     setMicEnabled(next);
   };
 
+  const handleSwitchAgent = () => {
+    const client = clientRef.current;
+    if (!client || !liveRef.current || !selectedAgentId || switchingToId) return;
+    setSwitchError(null);
+    // Optimistic pending state; the server confirms with `agent_switching` / `agent_changed`
+    // or rejects with `agent_switch_failed` (the previous agent keeps running).
+    setSwitchingToId(selectedAgentId);
+    clearSwitchTimer();
+    const attempt = attemptRef.current;
+    switchTimerRef.current = setTimeout(() => {
+      if (attempt !== attemptRef.current) return;
+      showSwitchError(describeAgentSwitchError('timeout'));
+    }, SWITCH_TIMEOUT_MS);
+    try {
+      client.sendClientMessage('switch_agent', { agent_id: selectedAgentId });
+    } catch {
+      showSwitchError(describeAgentSwitchError('swap_failed'));
+    }
+  };
+
   const handleOpenChange = (open: boolean) => {
     if (!open) {
       void teardown();
       setStatus('idle');
       setError(null);
+      resetSwitchState();
     }
     onOpenChange(open);
   };
 
   const isBusy = status === 'connecting';
   const isLive = status === 'connected';
+  const activeAgent = roomAgents.find((a) => a.id === activeAgentId);
+  const activeAgentName = activeAgent?.name ?? (activeAgentId === agent.id ? agent.name : 'the agent');
+  const switchableAgents = roomAgents.filter((a) => a.id !== activeAgentId);
+  const isSwitching = switchingToId !== null;
+  const switchingToName = roomAgents.find((a) => a.id === switchingToId)?.name;
 
   return (
     <Dialog open={isOpen} onOpenChange={handleOpenChange}>
@@ -216,7 +313,8 @@ const BrowserCallDialog: React.FC<BrowserCallDialogProps> = ({ isOpen, onOpenCha
         <DialogHeader>
           <DialogTitle>Talk in browser</DialogTitle>
           <DialogDescription>
-            Speak with <strong>{agent.name}</strong> using your microphone. No phone number is needed.
+            Speak with <strong>{isLive ? activeAgentName : agent.name}</strong> using your microphone. No phone number
+            is needed.
           </DialogDescription>
         </DialogHeader>
 
@@ -231,12 +329,54 @@ const BrowserCallDialog: React.FC<BrowserCallDialogProps> = ({ isOpen, onOpenCha
 
           {isLive && (
             <div className="flex items-center justify-between gap-3">
-              <p className="text-sm font-medium">Connected. Start speaking.</p>
+              <p className="text-sm font-medium">
+                {isSwitching
+                  ? `Switching to ${switchingToName ?? 'another agent'}...`
+                  : `Connected to ${activeAgentName}. Start speaking.`}
+              </p>
               <Button type="button" variant="outline" size="sm" onClick={handleToggleMic}>
                 {micEnabled ? <Mic /> : <MicOff />}
                 {micEnabled ? 'Mute' : 'Unmute'}
               </Button>
             </div>
+          )}
+
+          {isLive && switchableAgents.length > 0 && (
+            <div className="space-y-2">
+              <p className="frost-text-muted text-xs">Switch agent (the call stays connected)</p>
+              <div className="flex items-center gap-2">
+                <Select value={selectedAgentId} onValueChange={setSelectedAgentId} disabled={isSwitching}>
+                  <SelectTrigger aria-label="Agent to switch to">
+                    <SelectValue placeholder="Choose an agent" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {switchableAgents.map((a) => (
+                      <SelectItem key={a.id} value={a.id}>
+                        {a.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={handleSwitchAgent}
+                  disabled={!selectedAgentId || isSwitching}
+                  loading={isSwitching}
+                >
+                  <ArrowRightLeft />
+                  Switch
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {isLive && switchError && (
+            <Alert variant="destructive">
+              <AlertTriangle className="h-4 w-4" />
+              <AlertTitle>{switchError.title}</AlertTitle>
+              <AlertDescription>{switchError.message}</AlertDescription>
+            </Alert>
           )}
 
           {status === 'ended' && (

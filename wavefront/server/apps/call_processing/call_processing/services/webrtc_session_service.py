@@ -9,7 +9,14 @@ Lifecycle of a session:
     offer (token consumed) -> peer connects -> pipeline runs -> cleanup
 Cleanup always runs once, whether the client hung up, the connection never came
 up, the idle timeout fired, the max duration elapsed or the server is shutting
-down. It closes the peer connection and ends the room.
+down. It cancels any in-flight agent swap, closes the peer connection and ends
+the room.
+
+Agent hot-swap (browser ``switch_agent``): the session hands the pipeline a
+``SwapOptions`` (the room's allowlist, the config loader, a callback that
+records the swap on the room). The swap runs inside the live pipeline, so the
+peer connection, the idle watchdog and the max-duration timer below are not
+touched or reset by it.
 """
 
 from __future__ import annotations
@@ -38,6 +45,11 @@ from call_processing.log.logger import logger
 from call_processing.services.audio_config import WEBRTC_PROVIDER
 from call_processing.services.pipecat_service import PipecatService
 from call_processing.services.voice_agent_cache_service import VoiceAgentCacheService
+from call_processing.services.webrtc_agent_swap import (
+    AgentSwapController,
+    SessionHooks,
+    SwapOptions,
+)
 from call_processing.services.webrtc_room_service import (
     ERR_INVALID_JOIN_TOKEN,
     ERR_STICKY_REQUIRED,
@@ -69,6 +81,8 @@ class _Session:
     connected: asyncio.Event = field(default_factory=asyncio.Event)
     task: Optional[asyncio.Task] = None
     cleaned_up: bool = False
+    # Set by the pipeline once it is up (None until then / if swapping is off)
+    swap_controller: Optional[AgentSwapController] = None
 
     @property
     def pc_id(self) -> str:
@@ -248,6 +262,7 @@ class WebRTCSessionService:
                     audio_in_sample_rate=settings.sample_rate,
                     audio_out_sample_rate=settings.sample_rate,
                     idle_timeout_secs=IDLE_TIMEOUT_SECS,
+                    session_hooks=self._session_hooks(session),
                 ),
                 timeout=settings.max_session_secs,
             )
@@ -263,6 +278,28 @@ class WebRTCSessionService:
         finally:
             watchdog.cancel()
             await self._cleanup(session)
+
+    def _session_hooks(self, session: _Session) -> SessionHooks:
+        """What the live pipeline needs to hot-swap agents for this room."""
+        # The allowlist lives on the room (set by floware); the initial agent is
+        # always allowed. The browser can never widen it.
+        allowed = set(self.room_service.get_allowed_agent_ids(session.room_id))
+        allowed.add(session.voice_agent_id)
+
+        def on_agent_switched(agent_id: str) -> None:
+            self.room_service.record_swap(session.room_id, agent_id)
+
+        def on_ready(controller: Optional[AgentSwapController]) -> None:
+            session.swap_controller = controller
+
+        return SessionHooks(
+            swap=SwapOptions(
+                allowed_agent_ids=allowed,
+                load_agent_configs=self.voice_agent_cache_service.get_all_agent_configs,
+                on_agent_switched=on_agent_switched,
+            ),
+            on_ready=on_ready,
+        )
 
     async def _connect_watchdog(self, session: _Session) -> None:
         """End sessions whose peer connection never comes up."""
@@ -282,12 +319,20 @@ class WebRTCSessionService:
         if session.cleaned_up:
             return
         session.cleaned_up = True
-        self._sessions.pop(session.pc_id, None)
+        controller = session.swap_controller
+        if controller is not None:
+            try:
+                # A swap mid-flight is abandoned; this stays the single exit path
+                await controller.close()
+            except Exception as e:
+                logger.warning(f'Error cancelling agent swap {session.room_id}: {e}')
         try:
             await session.connection.disconnect()
         except Exception as e:
             logger.warning(f'Error closing WebRTC connection {session.pc_id}: {e}')
         self.room_service.end_room(session.room_id)
+        # Dropped last so ``active_sessions == 0`` means the room is fully gone
+        self._sessions.pop(session.pc_id, None)
         logger.info(f'WebRTC session cleaned up room={session.room_id}')
 
     async def close(self) -> None:

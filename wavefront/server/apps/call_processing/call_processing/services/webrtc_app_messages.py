@@ -8,21 +8,26 @@ Inbound (browser -> pipeline), via ``client.sendClientMessage(type, data)``:
         Swap the step overlay on the live system prompt, restrict the tools the
         LLM may call, and have the agent open the new step.
     ``interrupt``    {}  stop the bot's current speech (orb tap).
+    ``switch_agent`` {agent_id}  hot-swap the voice agent in this live room. The
+        target must be on the room's allowlist (enforced by the swap controller).
 
 Outbound (pipeline -> browser), via ``RTVIProcessor.send_server_message``:
     ``agent_state``  {state: listening | thinking | speaking}
     ``caption``      {role: 'agent', text, final}  what the bot is saying, as spoken
     ``transcript``   {role: 'user', text, final}   the user's finished utterance
+    ``agent_switching``      {agent_id}  a swap started (show a pending state)
+    ``agent_changed``        {agent_id, agent_name}  the swap finished
+    ``agent_switch_failed``  {code, message}  the previous agent keeps running
 
-One room is one pipeline: pages only send ``set_context``; nothing here creates
-or restarts a conversation.
+One room is one pipeline: pages only send ``set_context`` / ``switch_agent``;
+nothing here creates or restarts a conversation.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
@@ -52,11 +57,15 @@ from call_processing.services.tts_service import TTSServiceFactory
 # Inbound message types
 MSG_SET_CONTEXT = 'set_context'
 MSG_INTERRUPT = 'interrupt'
+MSG_SWITCH_AGENT = 'switch_agent'
 
 # Outbound message types
 MSG_AGENT_STATE = 'agent_state'
 MSG_CAPTION = 'caption'
 MSG_TRANSCRIPT = 'transcript'
+MSG_AGENT_SWITCHING = 'agent_switching'
+MSG_AGENT_CHANGED = 'agent_changed'
+MSG_AGENT_SWITCH_FAILED = 'agent_switch_failed'
 
 STATE_LISTENING = 'listening'
 STATE_THINKING = 'thinking'
@@ -114,6 +123,13 @@ def parse_set_context(data: Any) -> Optional[SetContext]:
 
 
 # ------------------------------------------------------------- prompt / tools
+
+
+def parse_switch_agent(data: Any) -> Optional[str]:
+    """Validate a ``switch_agent`` payload. Returns the agent id, or None."""
+    if not isinstance(data, dict):
+        return None
+    return _clean_str(data.get('agent_id', data.get('agentId')))
 
 
 def build_step_overlay(ctx: SetContext) -> str:
@@ -260,7 +276,18 @@ class BrowserSessionMessenger:
         self._stt_provider = stt_provider
         self._tts_voice_ids = tts_voice_ids or {}
         self._last_context_key: Optional[tuple] = None
+        self._last_context: Optional[SetContext] = None
         self._last_state: Optional[str] = None
+        # Agent swap support
+        self._on_switch_agent: Optional[Callable[[str], Awaitable[None]]] = None
+        self._swapping = False
+        self._deferred_context: Optional[SetContext] = None
+
+    def set_switch_handler(
+        self, handler: Optional[Callable[[str], Awaitable[None]]]
+    ) -> None:
+        """``handler(agent_id)`` receives validated-shape ``switch_agent`` requests."""
+        self._on_switch_agent = handler
 
     def bind_task(self, task: Any) -> None:
         """The messenger is needed to build the pipeline; the task comes after."""
@@ -293,6 +320,19 @@ class BrowserSessionMessenger:
                 {'type': MSG_TRANSCRIPT, 'role': 'user', 'text': text, 'final': True}
             )
 
+    async def emit_agent_switching(self, agent_id: str) -> None:
+        await self._send({'type': MSG_AGENT_SWITCHING, 'agent_id': agent_id})
+
+    async def emit_agent_changed(self, agent_id: str, agent_name: str) -> None:
+        await self._send(
+            {'type': MSG_AGENT_CHANGED, 'agent_id': agent_id, 'agent_name': agent_name}
+        )
+
+    async def emit_agent_switch_failed(self, code: str, message: str) -> None:
+        await self._send(
+            {'type': MSG_AGENT_SWITCH_FAILED, 'code': code, 'message': message}
+        )
+
     # -------------------------------------------------------------- inbound
 
     async def handle_client_message(self, message: Any) -> None:
@@ -307,16 +347,80 @@ class BrowserSessionMessenger:
                 if ctx is None:
                     logger.warning(f'Ignoring invalid set_context payload: {data!r}')
                     return
+                if self._swapping:
+                    # The agent is being swapped: applying now would target the
+                    # outgoing context. Keep only the latest and apply after.
+                    self._deferred_context = ctx
+                    return
                 await self.apply_context(ctx)
             elif msg_type == MSG_INTERRUPT:
-                await self._interrupt()
+                await self.interrupt()
+            elif msg_type == MSG_SWITCH_AGENT:
+                agent_id = parse_switch_agent(data)
+                if agent_id is None:
+                    logger.warning(f'Ignoring invalid switch_agent payload: {data!r}')
+                    await self.emit_agent_switch_failed(
+                        'invalid_request', 'switch_agent needs an agent_id'
+                    )
+                    return
+                if self._on_switch_agent is None:
+                    await self.emit_agent_switch_failed(
+                        'swap_failed',
+                        'Agent switching is not available in this session',
+                    )
+                    return
+                await self._on_switch_agent(agent_id)
         except Exception as e:
             logger.error(
                 f'Error handling browser message {msg_type}: {e}', exc_info=True
             )
 
-    async def _interrupt(self) -> None:
+    async def interrupt(self) -> None:
         await self._task.rtvi.interrupt_bot()
+
+    # -------------------------------------------------------------- agent swap
+
+    def rebind(
+        self,
+        *,
+        context: Any,
+        function_schemas: Sequence[FunctionSchema],
+        language_state: Dict[str, Any],
+        supported_languages: Sequence[str] = (),
+        tts_provider: str = '',
+        stt_provider: str = '',
+        tts_voice_ids: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Point the messenger at a new agent's context and language state."""
+        self._context = context
+        self._function_schemas = list(function_schemas)
+        self._language_state = language_state
+        self._supported_languages = list(supported_languages)
+        self._tts_provider = tts_provider
+        self._stt_provider = stt_provider
+        self._tts_voice_ids = tts_voice_ids or {}
+        # The new context has no overlay yet: let the same step apply again
+        self._last_context_key = None
+        self._last_state = None
+
+    def begin_swap(self) -> None:
+        self._swapping = True
+
+    def will_reopen_step(self) -> bool:
+        """True when ``finish_swap`` will apply a step context (and so speak)."""
+        return self._deferred_context is not None or self._last_context is not None
+
+    async def finish_swap(self) -> None:
+        """End the swap window and re-apply the app step on the (new) context.
+
+        Uses the ``set_context`` that arrived mid-swap if any, else the last one
+        applied, so the new agent keeps working on the same app step.
+        """
+        self._swapping = False
+        pending = self._deferred_context or self._last_context
+        self._deferred_context = None
+        if pending is not None:
+            await self.apply_context(pending)
 
     async def apply_context(self, ctx: SetContext) -> None:
         key = (ctx.step, ctx.field, ctx.language, ctx.instruction, ctx.allowed_tools)
@@ -324,6 +428,7 @@ class BrowserSessionMessenger:
             return  # duplicate (e.g. effect re-run); nothing to change
         first = self._last_context_key is None
         self._last_context_key = key
+        self._last_context = ctx
 
         overlay = build_step_overlay(ctx)
         await self._apply_prompt(ctx, overlay)
@@ -336,7 +441,7 @@ class BrowserSessionMessenger:
         # The first context lets the welcome message finish; later ones cut the
         # previous step's speech off before the agent opens the new step.
         if not first:
-            await self._interrupt()
+            await self.interrupt()
         await self._task.queue_frame(
             LLMMessagesAppendFrame(
                 messages=[{'role': 'user', 'content': STEP_OPENER}], run_llm=True

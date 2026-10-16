@@ -151,3 +151,64 @@ def test_attach_connection_keeps_ttl(rooms):
         )
         > 0
     )
+
+
+# ------------------------------------------------------------- agent allowlist
+
+OTHER_ID = str(uuid.uuid4())
+THIRD_ID = str(uuid.uuid4())
+
+
+def test_create_room_allowlist_always_includes_the_initial_agent(rooms):
+    room = rooms.create_room(AGENT_ID, [OTHER_ID, OTHER_ID, '', AGENT_ID])
+
+    record = rooms.get_room(room.room_id)
+    assert record['allowed_agent_ids'] == [AGENT_ID, OTHER_ID]
+    assert record['active_voice_agent_id'] == AGENT_ID
+    assert record['voice_agent_id'] == AGENT_ID
+    assert record['swap_count'] == 0
+    assert rooms.get_allowed_agent_ids(room.room_id) == [AGENT_ID, OTHER_ID]
+
+
+def test_room_without_allowlist_only_allows_the_initial_agent(rooms):
+    room = rooms.create_room(AGENT_ID)
+
+    assert rooms.get_allowed_agent_ids(room.room_id) == [AGENT_ID]
+    assert rooms.get_allowed_agent_ids(uuid.uuid4().hex) == []
+
+
+def test_record_swap_updates_active_agent_and_keeps_ttl(rooms):
+    room = rooms.create_room(AGENT_ID, [OTHER_ID])
+    rooms.consume_join_token(room.room_id, AGENT_ID, room.join_token)
+    key = f'{rooms.cache_manager.namespace}/webrtc_room:{room.room_id}'
+    ttl_before = rooms.cache_manager.redis.ttl(key)
+
+    assert rooms.record_swap(room.room_id, OTHER_ID) == 1
+    assert rooms.record_swap(room.room_id, AGENT_ID) == 2
+
+    record = rooms.get_room(room.room_id)
+    assert record['active_voice_agent_id'] == AGENT_ID
+    assert record['voice_agent_id'] == AGENT_ID
+    assert record['swap_count'] == 2
+    ttl_after = rooms.cache_manager.redis.ttl(key)
+    assert 0 < ttl_after <= ttl_before
+
+
+def test_record_swap_rejects_agents_outside_the_allowlist(rooms):
+    room = rooms.create_room(AGENT_ID, [OTHER_ID])
+    rooms.consume_join_token(room.room_id, AGENT_ID, room.join_token)
+
+    assert rooms.record_swap(room.room_id, THIRD_ID) is None
+
+    record = rooms.get_room(room.room_id)
+    assert record['active_voice_agent_id'] == AGENT_ID
+    assert record['swap_count'] == 0
+
+
+def test_record_swap_on_missing_or_ended_room_returns_none(rooms):
+    assert rooms.record_swap(uuid.uuid4().hex, AGENT_ID) is None
+
+    room = rooms.create_room(AGENT_ID, [OTHER_ID])
+    rooms.consume_join_token(room.room_id, AGENT_ID, room.join_token)
+    rooms.end_room(room.room_id)
+    assert rooms.record_swap(room.room_id, OTHER_ID) is None

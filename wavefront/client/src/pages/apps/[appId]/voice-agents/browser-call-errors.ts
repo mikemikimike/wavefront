@@ -121,3 +121,99 @@ export const classifyBrowserCallError = async (error: unknown): Promise<BrowserC
 
   return describeBrowserCallError('connection_failed');
 };
+
+/**
+ * Why a mid-call agent switch failed. These are the stable `code`s of the server's `agent_switch_failed`
+ * message. A failed switch never ends the call: the previous agent keeps running.
+ */
+export type AgentSwitchErrorCode =
+  | 'agent_not_allowed'
+  | 'agent_unavailable'
+  | 'swap_in_progress'
+  | 'swap_limit_reached'
+  | 'already_active'
+  | 'swap_failed'
+  | 'invalid_request'
+  | 'timeout';
+
+export interface AgentSwitchError {
+  code: AgentSwitchErrorCode | string;
+  title: string;
+  message: string;
+}
+
+const AGENT_SWITCH_ERRORS: Record<AgentSwitchErrorCode, Omit<AgentSwitchError, 'code'>> = {
+  agent_not_allowed: {
+    title: "Can't switch to that agent",
+    message: 'That agent is not available in this session. Pick another agent.',
+  },
+  agent_unavailable: {
+    title: 'Agent unavailable',
+    message: 'That agent is not active right now. Pick another agent; the current agent is still on the call.',
+  },
+  swap_in_progress: {
+    title: 'Switch already in progress',
+    message: 'Wait a moment for the current switch to finish, then try again.',
+  },
+  swap_limit_reached: {
+    title: 'Switch limit reached',
+    message: 'This session reached its limit on agent switches. Start a new session to switch again.',
+  },
+  already_active: {
+    title: 'Already talking to this agent',
+    message: 'That agent is already on the call.',
+  },
+  swap_failed: {
+    title: "Couldn't switch agents",
+    message: 'The switch failed, so you are still talking to the previous agent. Try again in a moment.',
+  },
+  invalid_request: {
+    title: "Couldn't switch agents",
+    message: 'The switch request was not valid. Pick an agent and try again.',
+  },
+  timeout: {
+    title: 'Agent switch timed out',
+    message: 'The switch took too long. You may still be talking to the previous agent; try again.',
+  },
+};
+
+export const describeAgentSwitchError = (code: string | undefined, serverMessage?: string): AgentSwitchError => {
+  const known = code && code in AGENT_SWITCH_ERRORS ? AGENT_SWITCH_ERRORS[code as AgentSwitchErrorCode] : undefined;
+  const base = known ?? AGENT_SWITCH_ERRORS.swap_failed;
+  return {
+    code: code ?? 'swap_failed',
+    title: base.title,
+    message: known || !serverMessage ? base.message : `${base.message} (${serverMessage})`,
+  };
+};
+
+/** Server -> browser messages about agent switching (RTVI server messages). */
+export type AgentSwitchServerMessage =
+  | { type: 'agent_switching'; agent_id: string }
+  | { type: 'agent_changed'; agent_id: string; agent_name?: string }
+  | { type: 'agent_switch_failed'; code?: string; message?: string };
+
+export const parseAgentSwitchMessage = (data: unknown): AgentSwitchServerMessage | null => {
+  if (!data || typeof data !== 'object') return null;
+  const msg = data as Record<string, unknown>;
+  switch (msg.type) {
+    case 'agent_switching':
+      return typeof msg.agent_id === 'string' ? { type: 'agent_switching', agent_id: msg.agent_id } : null;
+    case 'agent_changed':
+      return typeof msg.agent_id === 'string'
+        ? {
+            type: 'agent_changed',
+            agent_id: msg.agent_id,
+            agent_name: typeof msg.agent_name === 'string' ? msg.agent_name : undefined,
+          }
+        : null;
+    case 'agent_switch_failed':
+      return {
+        type: 'agent_switch_failed',
+        code: typeof msg.code === 'string' ? msg.code : undefined,
+        message: typeof msg.message === 'string' ? msg.message : undefined,
+      };
+    default:
+      return null;
+  }
+};
