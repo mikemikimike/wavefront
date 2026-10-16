@@ -289,6 +289,31 @@ async def test_multi_language_overlay_survives_in_original_prompt():
     assert state['current_language'] == 'hi'
 
 
+async def test_room_context_language_adds_no_language_instruction_prefix():
+    state = {
+        'current_language': 'en',
+        'switch_count': 0,
+        'original_system_prompt': 'BASE PROMPT',
+    }
+    messenger, context, task = _messenger(
+        language_state=state,
+        supported_languages=['en', 'hi'],
+        tts_provider='unknown-provider',
+        stt_provider='unknown-provider',
+        room_context_language=True,
+    )
+
+    await messenger.handle_client_message(
+        _msg('set_context', {'step': 'identity', 'language': 'hi', 'instruction': 'X.'})
+    )
+
+    system = context.get_messages()[0]['content']
+    assert system.startswith('BASE PROMPT')
+    assert 'Respond in' not in system
+    assert 'language code: hi' in system
+    assert state['current_language'] == 'hi'  # STT/TTS still follow the app
+
+
 async def test_agent_state_dedupes_and_events_use_server_messages():
     messenger, _, task = _messenger()
 
@@ -377,6 +402,14 @@ async def test_switch_events_payloads():
         {'type': 'agent_switching', 'agent_id': 'a-2'},
         {'type': 'agent_changed', 'agent_id': 'a-2', 'agent_name': 'Second'},
     ]
+
+
+async def test_language_changed_event_payload():
+    messenger, _, task = _messenger()
+
+    await messenger.emit_language_changed('hi')
+
+    assert task.rtvi.sent == [{'type': 'language_changed', 'language': 'hi'}]
 
 
 async def test_set_context_during_swap_is_deferred_and_applied_to_the_new_context():

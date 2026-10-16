@@ -212,3 +212,23 @@ def test_record_swap_on_missing_or_ended_room_returns_none(rooms):
     rooms.consume_join_token(room.room_id, AGENT_ID, room.join_token)
     rooms.end_room(room.room_id)
     assert rooms.record_swap(room.room_id, OTHER_ID) is None
+
+
+def test_language_flag_defaults_to_native_and_is_stored_per_room(rooms):
+    native = rooms.create_room(AGENT_ID)
+    room_ctx = rooms.create_room(AGENT_ID, room_context_handles_language=True)
+
+    assert rooms.get_room(native.room_id)['room_context_handles_language'] is False
+    assert rooms.get_room_context_handles_language(native.room_id) is False
+    assert rooms.get_room(room_ctx.room_id)['room_context_handles_language'] is True
+    assert rooms.get_room_context_handles_language(room_ctx.room_id) is True
+
+
+def test_language_flag_reads_false_for_old_or_missing_rooms(rooms):
+    room = rooms.create_room(AGENT_ID)
+    record = rooms.get_room(room.room_id)
+    del record['room_context_handles_language']  # a room from before the flag
+    rooms.cache_manager.set_json(rooms._key(room.room_id), record, expiry=600)
+
+    assert rooms.get_room_context_handles_language(room.room_id) is False
+    assert rooms.get_room_context_handles_language(uuid.uuid4().hex) is False

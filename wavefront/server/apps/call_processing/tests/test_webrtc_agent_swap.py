@@ -506,6 +506,9 @@ async def test_handoff_note_does_not_run_llm_when_an_app_step_will_reopen():
         await h.switch(B_ID)
         note = [f for f in h.queued if isinstance(f, LLMMessagesAppendFrame)][0]
         assert note.run_llm is False
+        content = note.messages[0]['content']
+        assert 'Do not continue' in content
+        assert 'where the conversation left off' not in content
 
 
 @pytest.mark.parametrize(

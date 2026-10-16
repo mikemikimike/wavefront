@@ -263,6 +263,11 @@ class WebRTCSessionService:
                     audio_out_sample_rate=settings.sample_rate,
                     idle_timeout_secs=IDLE_TIMEOUT_SECS,
                     session_hooks=self._session_hooks(session),
+                    room_context_handles_language=(
+                        self.room_service.get_room_context_handles_language(
+                            session.room_id
+                        )
+                    ),
                 ),
                 timeout=settings.max_session_secs,
             )

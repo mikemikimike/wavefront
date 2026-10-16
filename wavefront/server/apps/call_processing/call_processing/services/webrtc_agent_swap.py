@@ -298,13 +298,29 @@ def build_handoff_history(messages: Sequence[Any]) -> List[Dict[str, str]]:
     return history
 
 
-def build_handoff_note(previous_name: str, new_name: str) -> str:
+def build_handoff_note(
+    previous_name: str, new_name: str, *, new_step: bool = False
+) -> str:
+    """System-injected user turn after a hot-swap.
+
+    Does not ask the model to say its agent name — that fights prompts like
+    "Don't mention agent name" and produces unnatural handoffs.
+    ``new_name`` is kept in the signature for callers/tests; unused in the text.
+    """
+    del new_name  # reserved for logging/callers; never spoken in the note
     previous = f' from {previous_name}' if previous_name else ''
-    who = f' as {new_name}' if new_name else ''
+    if new_step:
+        # The app moved on: the earlier topic is finished, not something to pick up again
+        return (
+            f'[You just took over this conversation{previous}. The conversation so far '
+            f'is above for reference only: that step is finished. Do not continue, '
+            f'repeat or finish what was being said before. Start the current step '
+            f'now. Do not say your agent name.]'
+        )
     return (
         f'[You just took over this conversation{previous}. The conversation so far '
-        f'is above. Briefly introduce yourself{who}, then continue helping the '
-        f'user where the conversation left off. Do not repeat earlier answers.]'
+        f'is above. Continue helping the user where the conversation left off. '
+        f'Do not repeat earlier answers. Do not say your agent name.]'
     )
 
 
@@ -552,14 +568,17 @@ class AgentSwapController:
             tts_voice_ids=new_stack.tts_voice_ids,
         )
 
-        # 6. Let the new agent introduce itself. If an app step is active, the
+        # 6. Tell the new agent it took over. If an app step is active, the
         #    step opener (queued by ``finish_swap``) makes it speak, so the note
-        #    only needs to be in the context.
-        note = build_handoff_note(old_stack.agent_name, new_stack.agent_name)
+        #    only needs to be in the context (run_llm=False).
+        reopen = self._messenger.will_reopen_step()
+        note = build_handoff_note(
+            old_stack.agent_name, new_stack.agent_name, new_step=reopen
+        )
         await self._task.queue_frame(
             LLMMessagesAppendFrame(
                 messages=[{'role': 'user', 'content': note}],
-                run_llm=not self._messenger.will_reopen_step(),
+                run_llm=not reopen,
             )
         )
 

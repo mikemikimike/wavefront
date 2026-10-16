@@ -634,6 +634,10 @@ async def create_webrtc_room(
     the room as an allowlist (the browser cannot add to it). The optional body
     ``allowed_agent_ids`` narrows it. ``agents`` lists ``{id, name}`` of every
     agent the room can run (the initial one first) for the client's picker.
+
+    ``room_context_handles_language`` (default false): when true the app drives
+    the language through ``set_context.language``, so the agent is built without
+    the language-switching rules and ``detect_and_switch_language`` tool.
     """
     agent_dict = await voice_agent_service.get_agent(agent_id)
 
@@ -660,7 +664,11 @@ async def create_webrtc_room(
 
     try:
         room = await webrtc_room_client.create_room(
-            agent_id, allowed_agent_ids=[UUID(a['id']) for a in agents]
+            agent_id,
+            allowed_agent_ids=[UUID(a['id']) for a in agents],
+            room_context_handles_language=bool(
+                payload and payload.room_context_handles_language
+            ),
         )
     except WebRTCRoomClientError as e:
         return JSONResponse(

@@ -43,6 +43,9 @@ class CreateRoomRequest(BaseModel):
     # Agents the browser may hot-swap to mid-session. Decided by floware (the
     # browser only ever holds the join token); the initial agent is always allowed.
     allowed_agent_ids: Optional[List[UUID]] = None
+    # True: the app drives the language via set_context.language, so the agent
+    # gets no language-switching rules / detect_and_switch_language tool.
+    room_context_handles_language: bool = False
 
 
 class OfferBody(BaseModel):
@@ -112,6 +115,7 @@ async def create_room(
     room = room_service.create_room(
         str(body.voice_agent_id),
         allowed_agent_ids=[str(a) for a in body.allowed_agent_ids or []],
+        room_context_handles_language=body.room_context_handles_language,
     )
     return {
         'room_id': room.room_id,

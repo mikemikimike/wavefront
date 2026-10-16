@@ -11,6 +11,9 @@ Room record (``webrtc_room:{room_id}``), JSON:
                         ``voice_agent_id``); set by floware, never by the browser
     active_voice_agent_id  the agent currently serving the room
     swap_count          number of completed agent swaps
+    room_context_handles_language  true when the app drives the language via
+                        ``set_context.language`` (no language rules / tool for
+                        the agent); absent or false keeps native switching
 
 Peer connections themselves are NOT stored here (aiortc state is in-process);
 ``pc_id`` / ``instance_id`` are kept for diagnostics and sticky-routing errors.
@@ -175,12 +178,16 @@ class WebRTCRoomService:
         self,
         voice_agent_id: str,
         allowed_agent_ids: Optional[List[str]] = None,
+        room_context_handles_language: bool = False,
     ) -> CreatedRoom:
         """Create a pending room and mint its one-time join token.
 
         ``allowed_agent_ids`` is the set of agents the browser may hot-swap to.
         The initial agent is always included; ``voice_agent_id`` itself never
         changes (the join-token consume script depends on it).
+
+        ``room_context_handles_language`` makes the app (``set_context.language``)
+        the only thing that changes the language, for every agent in this room.
         """
         room_id = uuid.uuid4().hex
         join_token = secrets.token_urlsafe(32)
@@ -193,6 +200,7 @@ class WebRTCRoomService:
             'allowed_agent_ids': allowed,
             'active_voice_agent_id': voice_agent_id,
             'swap_count': 0,
+            'room_context_handles_language': bool(room_context_handles_language),
             'join_token_hash': hash_join_token(join_token),
             'status': ROOM_STATUS_PENDING,
             'created_at': time.time(),
@@ -262,6 +270,11 @@ class WebRTCRoomService:
         room = self.get_room(room_id) or {}
         allowed = room.get('allowed_agent_ids')
         return [str(a) for a in allowed] if isinstance(allowed, list) else []
+
+    def get_room_context_handles_language(self, room_id: str) -> bool:
+        """Whether the app drives this room's language (False if unset/gone)."""
+        room = self.get_room(room_id) or {}
+        return room.get('room_context_handles_language') is True
 
     def get_room(self, room_id: str) -> Optional[dict]:
         return self.cache_manager.get_json(self._key(room_id))

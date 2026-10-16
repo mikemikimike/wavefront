@@ -90,6 +90,17 @@ class TestWebRTCRoomClient:
             'allowed_agent_ids': [str(AGENT_ID), str(other)],
         }
 
+    async def test_create_room_sends_the_language_flag_only_when_true(self, transport):
+        await make_client().create_room(AGENT_ID, room_context_handles_language=True)
+        await make_client().create_room(AGENT_ID, room_context_handles_language=False)
+
+        first, second = transport.requests
+        assert json.loads(first.content) == {
+            'voice_agent_id': str(AGENT_ID),
+            'room_context_handles_language': True,
+        }
+        assert json.loads(second.content) == {'voice_agent_id': str(AGENT_ID)}
+
     async def test_create_room_points_browser_at_floware_when_proxying(self, transport):
         room = await make_client(signaling_via_floware=True).create_room(AGENT_ID)
 
@@ -180,7 +191,9 @@ class TestCreateRoomEndpoint:
         assert body['data']['join_token'] == 'one-time-token'
         assert body['data']['room_id'] == 'room-1'
         room_client.create_room.assert_awaited_once_with(
-            AGENT_ID, allowed_agent_ids=[AGENT_ID]
+            AGENT_ID,
+            allowed_agent_ids=[AGENT_ID],
+            room_context_handles_language=False,
         )
         assert body['data']['agents'] == [{'id': str(AGENT_ID), 'name': 'Alpha'}]
 
@@ -269,6 +282,21 @@ class TestCreateRoomAllowlist:
         )
 
         assert [a['id'] for a in data['agents']] == [str(AGENT_ID), beta['id']]
+
+    async def test_language_flag_defaults_to_native_and_is_forwarded_when_set(self):
+        room_client, _ = await self._create([])
+        assert (
+            room_client.create_room.await_args.kwargs['room_context_handles_language']
+            is False
+        )
+
+        room_client, _ = await self._create(
+            [], CreateWebRTCRoomPayload(room_context_handles_language=True)
+        )
+        assert (
+            room_client.create_room.await_args.kwargs['room_context_handles_language']
+            is True
+        )
 
     async def test_allowlist_is_capped(self):
         many = [other_agent(f'A{i}') for i in range(MAX_ROOM_SWITCHABLE_AGENTS + 10)]

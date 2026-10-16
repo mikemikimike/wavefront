@@ -60,12 +60,17 @@ class WebRTCRoomClient:
         self,
         voice_agent_id: UUID,
         allowed_agent_ids: Optional[List[UUID]] = None,
+        room_context_handles_language: bool = False,
     ) -> Dict[str, Any]:
         """Create a room. Returns room_id, voice_agent_id, join_token, signaling_url.
 
         ``allowed_agent_ids`` is the allowlist for hot-swapping the voice agent
         mid-session (call_processing always adds the initial agent). Omit it for a
         room that cannot switch agents.
+
+        ``room_context_handles_language`` is only sent when true (the default
+        keeps native language switching, and older call_processing instances
+        never see the field).
 
         With ``signaling_via_floware`` the returned ``signaling_url`` is the
         floware-relative proxy path (and ``signaling_via_floware`` is true), so
@@ -80,6 +85,8 @@ class WebRTCRoomClient:
         body: Dict[str, Any] = {'voice_agent_id': str(voice_agent_id)}
         if allowed_agent_ids is not None:
             body['allowed_agent_ids'] = [str(a) for a in allowed_agent_ids]
+        if room_context_handles_language:
+            body['room_context_handles_language'] = True
 
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:

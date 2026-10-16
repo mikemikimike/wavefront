@@ -15,12 +15,21 @@ Outbound (pipeline -> browser), via ``RTVIProcessor.send_server_message``:
     ``agent_state``  {state: listening | thinking | speaking}
     ``caption``      {role: 'agent', text, final}  what the bot is saying, as spoken
     ``transcript``   {role: 'user', text, final}   the user's finished utterance
+    ``language_changed``     {language}  the agent settled on the user's language
     ``agent_switching``      {agent_id}  a swap started (show a pending state)
     ``agent_changed``        {agent_id, agent_name}  the swap finished
     ``agent_switch_failed``  {code, message}  the previous agent keeps running
 
 One room is one pipeline: pages only send ``set_context`` / ``switch_agent``;
 nothing here creates or restarts a conversation.
+
+Language handling has two modes, chosen per room at creation
+(``room_context_handles_language``):
+    native (default)  the agent gets language rules and a ``detect_and_switch_language``
+        tool; ``set_context.language`` also prefixes a language instruction.
+    room context      only ``set_context.language`` changes the language (STT/TTS
+        move with it); the prompt gets just the step overlay, and no
+        ``language_changed`` event is emitted because no tool exists to raise it.
 """
 
 from __future__ import annotations
@@ -63,6 +72,7 @@ MSG_SWITCH_AGENT = 'switch_agent'
 MSG_AGENT_STATE = 'agent_state'
 MSG_CAPTION = 'caption'
 MSG_TRANSCRIPT = 'transcript'
+MSG_LANGUAGE_CHANGED = 'language_changed'
 MSG_AGENT_SWITCHING = 'agent_switching'
 MSG_AGENT_CHANGED = 'agent_changed'
 MSG_AGENT_SWITCH_FAILED = 'agent_switch_failed'
@@ -265,7 +275,11 @@ class BrowserSessionMessenger:
         tts_provider: str = '',
         stt_provider: str = '',
         tts_voice_ids: Optional[Dict[str, str]] = None,
+        room_context_language: bool = False,
     ):
+        # Room property (kept across agent swaps): the app alone drives the
+        # language, so the prompt carries no language instruction prefix.
+        self._room_context_language = room_context_language
         self._task: Any = None  # set via bind_task once the PipelineTask exists
         self._context = context
         self._function_schemas = list(function_schemas)
@@ -319,6 +333,9 @@ class BrowserSessionMessenger:
             await self._send(
                 {'type': MSG_TRANSCRIPT, 'role': 'user', 'text': text, 'final': True}
             )
+
+    async def emit_language_changed(self, language: str) -> None:
+        await self._send({'type': MSG_LANGUAGE_CHANGED, 'language': language})
 
     async def emit_agent_switching(self, agent_id: str) -> None:
         await self._send({'type': MSG_AGENT_SWITCHING, 'agent_id': agent_id})
@@ -458,10 +475,14 @@ class BrowserSessionMessenger:
             new_original = apply_step_overlay(original, overlay)
             self._language_state['original_system_prompt'] = new_original
             language = self._resolve_language(ctx.language)
-            instruction = LANGUAGE_INSTRUCTIONS.get(
-                language, LANGUAGE_INSTRUCTIONS.get('en', 'Respond in English.')
-            )
-            content = f'{instruction}\n\n{new_original}'
+            if self._room_context_language:
+                # The overlay already states the language; no extra instruction
+                content = new_original
+            else:
+                instruction = LANGUAGE_INSTRUCTIONS.get(
+                    language, LANGUAGE_INSTRUCTIONS.get('en', 'Respond in English.')
+                )
+                content = f'{instruction}\n\n{new_original}'
             await self._switch_services_language(language)
         else:
             current = ''

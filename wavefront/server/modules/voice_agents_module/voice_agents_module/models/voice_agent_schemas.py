@@ -30,6 +30,16 @@ class CreateVoiceAgentPayload(BaseModel):
         ...,
         description='Welcome message to play at call start (will be converted to audio)',
     )
+    # Must be declared before tts_voice_ids so the voice-id validator can read it
+    # (Pydantic v1 validators only see already-validated fields).
+    supported_languages: Optional[List[str]] = Field(
+        None,
+        description='List of supported language codes (ISO 639-1, e.g., ["en", "hi", "te"])',
+    )
+    default_language: str = Field(
+        'en',
+        description='Default language if detection fails (must be in supported_languages)',
+    )
     tts_voice_ids: Dict[str, str] = Field(
         ...,
         description='TTS voice identifiers per language (e.g., {"en": "alloy", "hi": "shimmer"})',
@@ -51,14 +61,6 @@ class CreateVoiceAgentPayload(BaseModel):
     outbound_numbers: Optional[List[str]] = Field(
         None,
         description='Phone numbers for making outbound calls (E.164 format)',
-    )
-    supported_languages: Optional[List[str]] = Field(
-        None,
-        description='List of supported language codes (ISO 639-1, e.g., ["en", "hi", "te"])',
-    )
-    default_language: str = Field(
-        'en',
-        description='Default language if detection fails (must be in supported_languages)',
     )
 
     @validator('tts_voice_ids')
@@ -156,5 +158,14 @@ class CreateWebRTCRoomPayload(BaseModel):
             'Narrow the agents this browser room may hot-swap to. Only active '
             'agents ever qualify; this can remove agents, never add them. '
             'Omit to allow every active agent.'
+        ),
+    )
+    room_context_handles_language: bool = Field(
+        False,
+        description=(
+            'When true, the app drives the conversation language through the room '
+            'context (set_context.language): the agent gets no language-switching '
+            'rules and no detect_and_switch_language tool. Default false keeps the '
+            "agent's native language switching."
         ),
     )

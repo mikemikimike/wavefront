@@ -133,8 +133,14 @@ class PipecatService:
         audio_in_sample_rate: int,
         audio_out_sample_rate: int,
         shared: SharedSession,
+        room_context_language: bool = False,
     ) -> AgentStack:
         """Build everything that belongs to a single agent.
+
+        ``room_context_language`` (browser rooms): the app drives the language via
+        ``set_context.language``, so a multi-language agent gets no language
+        instruction prefix, no LANGUAGE SWITCHING RULES and no
+        ``detect_and_switch_language`` tool. STT/TTS are still multi-language.
 
         STT/LLM/TTS services (with the browser 16 kHz override), system prompt and
         language rules, tools, conversation context and its aggregators. Call-level
@@ -149,6 +155,8 @@ class PipecatService:
         supported_languages = agent_config.get('supported_languages', ['en'])
         default_language = agent_config.get('default_language', 'en')
         is_multi_language = len(supported_languages) > 1
+        # The model-driven language tool and its prompt rules (native approach)
+        use_language_tool = is_multi_language and not room_context_language
 
         # Extract TTS/STT parameters from agent
         tts_voice_ids_dict = agent_config.get(
@@ -246,14 +254,21 @@ class PipecatService:
             f'{get_current_ist_time_str()}\n' + agent_config['system_prompt']
         )
 
+        supported_language_names = [
+            LANGUAGE_DISPLAY_NAMES.get(code, code) for code in supported_languages
+        ]
+
         # Add language instruction for default language if multi-language
-        if is_multi_language:
+        if is_multi_language and room_context_language:
+            # The app sets the language through the step overlay; keep the prompt
+            # exactly as the agent author wrote it.
+            system_content = base_system_prompt
+            # Non-empty marks the agent as multi-language for the browser messenger
+            language_state['original_system_prompt'] = base_system_prompt
+        elif is_multi_language:
             initial_language_instruction = LANGUAGE_INSTRUCTIONS.get(
                 default_language, LANGUAGE_INSTRUCTIONS.get('en', 'Respond in English.')
             )
-            supported_language_names = [
-                LANGUAGE_DISPLAY_NAMES.get(code, code) for code in supported_languages
-            ]
             language_switching_rules = (
                 f"\n\nLANGUAGE SWITCHING RULES (follow exactly, no exceptions):\n"
                 f"Supported languages: {', '.join(supported_language_names)}.\n"
@@ -339,8 +354,13 @@ class PipecatService:
         task_container = shared.task_container
         context_container = {'context': None}
 
-        # Register language detection tool if multi-language enabled
-        if is_multi_language:
+        async def on_language_selected(language: str) -> None:
+            # Browser sessions: tell the app which language the agent settled on
+            if shared.messenger is not None:
+                await shared.messenger.emit_language_changed(language)
+
+        # Register language detection tool (native approach only)
+        if use_language_tool:
             from call_processing.services.language_detection_tool import (
                 LanguageDetectionToolFactory,
             )
@@ -355,6 +375,7 @@ class PipecatService:
                     supported_languages=supported_languages,
                     default_language=default_language,
                     language_state=language_state,
+                    on_language_selected=on_language_selected,
                 )
             )
 
@@ -393,7 +414,7 @@ class PipecatService:
 
         # Create FunctionSchema for language detection (if multi-language)
         language_detection_schemas = []
-        if is_multi_language:
+        if use_language_tool:
             language_detection_schema = FunctionSchema(
                 name='detect_and_switch_language',
                 description=(
@@ -434,8 +455,8 @@ class PipecatService:
         # Create LLM context and aggregator
         context = LLMContext(messages, tools=tools_schema)
 
-        # Populate context container for language detection tool (if multi-language)
-        if is_multi_language:
+        # Populate context container for language detection tool (if registered)
+        if use_language_tool:
             context_container['context'] = context
 
         context_aggregator = LLMContextAggregatorPair(
@@ -561,6 +582,7 @@ class PipecatService:
         audio_out_sample_rate: int = TELEPHONY_SAMPLE_RATE,
         idle_timeout_secs: int = 300,
         session_hooks: Optional[SessionHooks] = None,
+        room_context_handles_language: bool = False,
     ):
         """Create and run the Pipecat pipeline for a voice conversation.
 
@@ -580,10 +602,14 @@ class PipecatService:
             session_hooks: Browser (WebRTC) sessions only. Enables hot-swapping the
                 voice agent in the live room and receives the swap controller
                 via ``on_ready`` once the pipeline task exists.
+            room_context_handles_language: Browser sessions only. The app drives
+                the language via ``set_context.language``, so agents (including
+                ones swapped in later) get no language rules / language tool.
         """
         _ensure_pipecat_tracing(self.settings)
         pipecat_settings = self.settings.pipecat
         is_webrtc = provider == WEBRTC_PROVIDER
+        room_context_language = is_webrtc and room_context_handles_language
 
         # --- Call evaluation: transcript log and stats (shared by every agent stack) ---
         transcript_log: List[Dict[str, Any]] = []
@@ -611,6 +637,7 @@ class PipecatService:
                 audio_in_sample_rate=audio_in_sample_rate,
                 audio_out_sample_rate=audio_out_sample_rate,
                 shared=shared,
+                room_context_language=room_context_language,
             )
 
         stack = build_stack(
@@ -635,7 +662,10 @@ class PipecatService:
                 context=stack.context,
                 function_schemas=stack.function_schemas,
                 language_state=stack.language_state,
-                always_allowed_tools=['detect_and_switch_language'],
+                always_allowed_tools=(
+                    [] if room_context_language else ['detect_and_switch_language']
+                ),
+                room_context_language=room_context_language,
                 supported_languages=stack.supported_languages,
                 tts_provider=stack.tts_provider,
                 stt_provider=stack.stt_provider,

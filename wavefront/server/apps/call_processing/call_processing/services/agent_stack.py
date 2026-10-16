@@ -27,7 +27,8 @@ class AgentStack:
     context: Any
     context_aggregator: Any
     language_state: Dict[str, Any]
-    # Every schema the LLM may be given, including ``detect_and_switch_language``
+    # Every schema the LLM may be given; includes ``detect_and_switch_language``
+    # unless the room's context drives the language (room_context_handles_language)
     function_schemas: List[FunctionSchema]
     # Empty for single-language agents
     supported_languages: List[str]
