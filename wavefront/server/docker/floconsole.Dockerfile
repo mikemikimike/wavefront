@@ -32,6 +32,11 @@ RUN chmod +x /app/scripts/console-server-init.sh
 
 RUN uv sync --package floconsole --frozen --no-dev
 
+# uv.lock covers the whole workspace, but only this app's deps are in the venv;
+# scanners (AWS Inspector) report every package in it. `uv run --frozen --no-sync`
+# does not need it.
+RUN rm uv.lock
+
 RUN useradd -m -u 1000 appuser && \
     chown -R appuser:appuser /app
 
