@@ -1,19 +1,24 @@
-# bookworm: buster (Debian 10) is end-of-life and no longer receives security fixes
-FROM python:3.11-slim-bookworm
+# Wolfi (Chainguard's glibc-based distro) instead of Debian slim: its packages
+# carry no unpatched CVEs, whereas Debian ships glibc/zlib/util-linux issues it
+# marks no-fix. Pinned by digest; bump with `docker pull` + rescan.
+FROM cgr.dev/chainguard/wolfi-base@sha256:256c88bb066424045021090932d50be93c8e3f2ce3586707702a401b146f3e43
 
 # Copy UV from official image
 COPY --from=ghcr.io/astral-sh/uv:0.12.24 /uv /uvx /bin/
 
-# Keep uv/pip download caches out of the image layers
+# Keep uv/pip download caches out of the image layers; build the venv on the
+# distro's python3.11 rather than a uv-downloaded interpreter (not UV_PYTHON:
+# that would also point `uv pip` at the system interpreter instead of the venv)
 ENV UV_NO_CACHE=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    UV_PYTHON_PREFERENCE=only-system \
+    UV_PYTHON_DOWNLOADS=never
 
-RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
-
-# The app runs from the uv venv, so drop the base image's system pip/setuptools/wheel
-# (and the vendored copies of urllib3, msgpack, etc. they carry)
-RUN pip uninstall -y pip setuptools wheel && \
-    rm -rf /usr/local/lib/python3.11/ensurepip/_bundled
+# bash is for the startup script. The app runs from the uv venv, so drop
+# ensurepip's bundled pip/setuptools wheels (they vendor urllib3, msgpack, etc.)
+RUN apk upgrade --no-cache && \
+    apk add --no-cache bash python-3.11 && \
+    rm -rf /usr/lib/python3.11/ensurepip/_bundled
 
 # Set working directory
 WORKDIR /app
@@ -50,9 +55,8 @@ RUN chmod +x startup-rag-ingestion.sh
 # Create a non-root user with UID 1000 and ensure files are owned by that user
 # This allows Kubernetes pods using securityContext.runAsUser: 1000 to work
 RUN set -eux \
-    && groupadd -g 1000 appuser || true \
-    && useradd -u 1000 -g 1000 -m -s /usr/sbin/nologin appuser || true \
-    && chown -R 1000:1000 /app /root/.cache/tiktoken || true
+    && adduser -D -u 1000 -s /sbin/nologin appuser \
+    && chown -R 1000:1000 /app /root/.cache/tiktoken
 
 # Switch to the non-root user (UID 1000) so containers can run with securityContext 1000
 USER 1000
