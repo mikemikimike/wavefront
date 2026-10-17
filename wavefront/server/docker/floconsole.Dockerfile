@@ -2,18 +2,28 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY --from=ghcr.io/astral-sh/uv:0.12.10 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.12.24 /uv /uvx /bin/
 
-RUN apt-get update && apt-get install -y \
+# Keep uv/pip download caches out of the image layers
+ENV UV_NO_CACHE=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     libpq-dev \
     gcc \
     && rm -rf /var/lib/apt/lists/*
+
+# The app runs from the uv venv, so drop the base image's system pip/setuptools/wheel
+# (and the vendored copies of urllib3, msgpack, etc. they carry)
+RUN pip uninstall -y pip setuptools wheel && \
+    rm -rf /usr/local/lib/python3.11/ensurepip/_bundled
 
 COPY wavefront/server/pyproject.toml wavefront/server/uv.lock ./
 
 COPY wavefront/server/modules/common_module /app/modules/common_module
 
 COPY wavefront/server/packages/flo_cloud /app/packages/flo_cloud
+COPY wavefront/server/packages/flo_lib /app/packages/flo_lib
 
 COPY wavefront/server/apps/floconsole /app/apps/floconsole
 
