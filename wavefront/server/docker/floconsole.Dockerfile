@@ -1,22 +1,24 @@
-FROM python:3.11-slim
+# Wolfi (Chainguard's glibc-based distro) instead of Debian slim: its packages
+# carry no unpatched CVEs, whereas Debian ships glibc/zlib/util-linux issues it
+# marks no-fix. Pinned by digest; bump with `docker pull` + rescan.
+FROM cgr.dev/chainguard/wolfi-base@sha256:256c88bb066424045021090932d50be93c8e3f2ce3586707702a401b146f3e43
 
 WORKDIR /app
 
 COPY --from=ghcr.io/astral-sh/uv:0.12.24 /uv /uvx /bin/
 
-# Keep uv/pip download caches out of the image layers
+# Keep uv/pip download caches out of the image layers; build the venv on the
+# distro's python3.11 rather than a uv-downloaded interpreter (not UV_PYTHON:
+# that would also point `uv pip` at the system interpreter instead of the venv)
 ENV UV_NO_CACHE=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    UV_PYTHON_PREFERENCE=only-system \
+    UV_PYTHON_DOWNLOADS=never
 
-RUN apt-get update && apt-get upgrade -y && apt-get install -y \
-    libpq-dev \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
-
-# The app runs from the uv venv, so drop the base image's system pip/setuptools/wheel
-# (and the vendored copies of urllib3, msgpack, etc. they carry)
-RUN pip uninstall -y pip setuptools wheel && \
-    rm -rf /usr/local/lib/python3.11/ensurepip/_bundled
+# Every locked dependency ships a wheel (psycopg/psycopg2 -binary bundle libpq),
+# so no compiler, headers or libpq are needed; bash is for the init script.
+RUN apk upgrade --no-cache && \
+    apk add --no-cache bash python-3.11
 
 COPY wavefront/server/pyproject.toml wavefront/server/uv.lock ./
 
@@ -37,7 +39,7 @@ RUN uv sync --package floconsole --frozen --no-dev
 # does not need it.
 RUN rm uv.lock
 
-RUN useradd -m -u 1000 appuser && \
+RUN adduser -D -u 1000 appuser && \
     chown -R appuser:appuser /app
 
 # Switch to the non-root user for all subsequent instructions
