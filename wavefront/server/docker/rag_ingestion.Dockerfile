@@ -32,6 +32,11 @@ COPY wavefront/server/scripts/rag_ingestion/startup-rag-ingestion.sh ./backgroun
 # Install dependencies
 RUN uv sync --package rag-ingestion --frozen --no-dev
 
+# uv.lock covers the whole workspace, but only this app's deps are in the venv;
+# scanners (AWS Inspector) report every package in it. `uv run --frozen --no-sync`
+# does not need it.
+RUN rm uv.lock
+
 # Download the tiktoken encoding file and NLTK data
 RUN mkdir -p /root/.cache/tiktoken
 RUN /app/.venv/bin/python -c "import tiktoken; enc = tiktoken.encoding_for_model('gpt-4')"
