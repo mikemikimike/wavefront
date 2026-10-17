@@ -5,15 +5,18 @@ FROM cgr.dev/chainguard/wolfi-base@sha256:256c88bb066424045021090932d50be93c8e3f
 
 WORKDIR /app
 
-COPY --from=ghcr.io/astral-sh/uv:0.12.24 /uv /uvx /bin/
-
+# uv is bind-mounted only into the RUN steps that need it (ghcr.io/astral-sh/uv:0.12.24), so the
+# image does not ship the uv binary and the Rust crates it bundles; the app
+# runs straight from the venv.
 # Keep uv/pip download caches out of the image layers; build the venv on the
 # distro's python3.11 rather than a uv-downloaded interpreter (not UV_PYTHON:
 # that would also point `uv pip` at the system interpreter instead of the venv)
 ENV UV_NO_CACHE=1 \
     PIP_NO_CACHE_DIR=1 \
     UV_PYTHON_PREFERENCE=only-system \
-    UV_PYTHON_DOWNLOADS=never
+    UV_PYTHON_DOWNLOADS=never \
+    VIRTUAL_ENV=/app/.venv \
+    PATH=/app/.venv/bin:$PATH
 
 # Every locked dependency ships a wheel (psycopg/psycopg2 -binary bundle libpq),
 # so no compiler, headers or libpq are needed; bash is for the init script.
@@ -53,11 +56,11 @@ COPY wavefront/server/apps/floware /app/apps/floware
 COPY wavefront/server/scripts/floware-init.sh /app/scripts/floware-init.sh
 RUN chmod +x /app/scripts/floware-init.sh
 
-RUN uv sync --package floware --frozen --no-dev
+RUN --mount=from=ghcr.io/astral-sh/uv:0.12.24,source=/uv,target=/bin/uv uv sync --package floware --frozen --no-dev
 
 # uv.lock covers the whole workspace, but only this app's deps are in the venv;
-# scanners (AWS Inspector) report every package in it. `uv run --frozen --no-sync`
-# does not need it.
+# scanners (AWS Inspector) report every package in it, and nothing reads it at
+# runtime.
 RUN rm uv.lock
 
 # spaCy model for Presidio, which arrives with the flo-ai[guardrails] extra
@@ -68,7 +71,7 @@ RUN rm uv.lock
 # `pip` is installed on purpose: `spacy download` resolves the model version
 # and then shells out to `python -m pip install`, and a uv-created venv has no
 # pip, so the download fails without it.
-RUN uv pip install pip && \
+RUN --mount=from=ghcr.io/astral-sh/uv:0.12.24,source=/uv,target=/bin/uv uv pip install pip && \
     /app/.venv/bin/python -m spacy download en_core_web_lg && \
     uv pip uninstall pip
 
