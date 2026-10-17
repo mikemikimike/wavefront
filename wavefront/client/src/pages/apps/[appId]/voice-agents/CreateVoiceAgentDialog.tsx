@@ -14,6 +14,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Checkbox } from '@app/components/ui/checkbox';
 import { Label } from '@app/components/ui/label';
 import { Slider } from '@app/components/ui/slider';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@app/components/ui/tabs';
 import {
   useGetLLMConfigs,
   useGetSttConfigs,
@@ -36,11 +37,24 @@ import { popupCodeMirrorExtensions } from '@app/lib/code-mirror';
 import { langs } from '@uiw/codemirror-extensions-langs';
 import CodeMirror from '@uiw/react-codemirror';
 import React, { useEffect, useState } from 'react';
-import { useForm } from 'react-hook-form';
+import { FieldErrors, useForm } from 'react-hook-form';
 import { useNavigate } from 'react-router';
 import { z } from 'zod';
 
 const E164_REGEX = /^\+[1-9]\d{1,14}$/;
+
+const FORM_TAB = {
+  BASIC: 'basic',
+  CONFIGURATIONS: 'configurations',
+  PHONE_NUMBERS: 'phone-numbers',
+  LANGUAGES: 'languages',
+  BEHAVIOR: 'behavior',
+  ADVANCED: 'advanced',
+} as const;
+
+type FormTab = (typeof FORM_TAB)[keyof typeof FORM_TAB];
+
+const isFormTab = (value: string): value is FormTab => Object.values(FORM_TAB).includes(value as FormTab);
 
 const createVoiceAgentSchema = z.object({
   name: z.string().min(1, 'Name is required').max(100, 'Name must be 100 characters or less'),
@@ -66,6 +80,24 @@ const createVoiceAgentSchema = z.object({
 
 type CreateVoiceAgentInput = z.infer<typeof createVoiceAgentSchema>;
 
+const FIELD_TAB_MAP: Record<keyof CreateVoiceAgentInput, FormTab> = {
+  name: FORM_TAB.BASIC,
+  description: FORM_TAB.BASIC,
+  status: FORM_TAB.BASIC,
+  llm_config_id: FORM_TAB.CONFIGURATIONS,
+  tts_config_id: FORM_TAB.CONFIGURATIONS,
+  stt_config_id: FORM_TAB.CONFIGURATIONS,
+  telephony_config_id: FORM_TAB.CONFIGURATIONS,
+  tts_voice_ids: FORM_TAB.CONFIGURATIONS,
+  inbound_numbers: FORM_TAB.PHONE_NUMBERS,
+  outbound_numbers: FORM_TAB.PHONE_NUMBERS,
+  supported_languages: FORM_TAB.LANGUAGES,
+  default_language: FORM_TAB.LANGUAGES,
+  system_prompt: FORM_TAB.BEHAVIOR,
+  welcome_message: FORM_TAB.BEHAVIOR,
+  conversation_config: FORM_TAB.ADVANCED,
+};
+
 interface CreateVoiceAgentDialogProps {
   isOpen: boolean;
   onOpenChange: (open: boolean) => void;
@@ -78,6 +110,7 @@ const CreateVoiceAgentDialog: React.FC<CreateVoiceAgentDialogProps> = ({ isOpen,
   const { notifySuccess, notifyError } = useNotifyStore();
   const { selectedApp } = useDashboardStore();
   const [creating, setCreating] = useState(false);
+  const [activeTab, setActiveTab] = useState<FormTab>(FORM_TAB.BASIC);
   const [ttsParameters, setTtsParameters] = useState<Record<string, unknown>>({});
   const [sttParameters, setSttParameters] = useState<Record<string, unknown>>({});
   const [voiceIdState, setVoiceIdState] = useState<Record<string, string>>({ en: '' });
@@ -169,8 +202,16 @@ const CreateVoiceAgentDialog: React.FC<CreateVoiceAgentDialogProps> = ({ isOpen,
       setTtsParameters({});
       setSttParameters({});
       setVoiceIdState({ en: '' });
+      setActiveTab(FORM_TAB.BASIC);
     }
   }, [isOpen, form]);
+
+  const onInvalid = (errors: FieldErrors<CreateVoiceAgentInput>) => {
+    const firstErrorField = Object.keys(errors)[0] as keyof CreateVoiceAgentInput | undefined;
+    if (firstErrorField && FIELD_TAB_MAP[firstErrorField]) {
+      setActiveTab(FIELD_TAB_MAP[firstErrorField]);
+    }
+  };
 
   const onSubmit = async (data: CreateVoiceAgentInput) => {
     // Validate JSON if provided
@@ -512,18 +553,31 @@ const CreateVoiceAgentDialog: React.FC<CreateVoiceAgentDialogProps> = ({ isOpen,
 
   return (
     <Dialog open={isOpen} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[90vh] max-w-4xl min-w-0 overflow-y-auto lg:max-w-4xl">
-        <DialogHeader>
+      <DialogContent className="flex h-[760px] max-h-[calc(100vh-2rem)] max-w-4xl min-w-0 flex-col overflow-hidden lg:max-w-4xl">
+        <DialogHeader className="shrink-0">
           <DialogTitle>Create New Voice Agent</DialogTitle>
           <DialogDescription>Create a new voice agent for {selectedApp?.app_name}</DialogDescription>
         </DialogHeader>
 
         <Form {...form}>
-          <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
-            <div className="space-y-6">
-              {/* Basic Information */}
-              <div className="space-y-4">
-                <h3 className="text-sm font-semibold">Basic Information</h3>
+          <form onSubmit={form.handleSubmit(onSubmit, onInvalid)} className="flex min-h-0 flex-1 flex-col">
+            <Tabs
+              value={activeTab}
+              onValueChange={(value) => {
+                if (isFormTab(value)) setActiveTab(value);
+              }}
+              className="flex min-h-0 flex-1 flex-col overflow-hidden"
+            >
+              <TabsList className="grid w-full shrink-0 grid-cols-6">
+                <TabsTrigger value={FORM_TAB.BASIC}>Basic Info</TabsTrigger>
+                <TabsTrigger value={FORM_TAB.CONFIGURATIONS}>Configurations</TabsTrigger>
+                <TabsTrigger value={FORM_TAB.PHONE_NUMBERS}>Phone Numbers</TabsTrigger>
+                <TabsTrigger value={FORM_TAB.LANGUAGES}>Languages</TabsTrigger>
+                <TabsTrigger value={FORM_TAB.BEHAVIOR}>Behavior</TabsTrigger>
+                <TabsTrigger value={FORM_TAB.ADVANCED}>Advanced</TabsTrigger>
+              </TabsList>
+
+              <TabsContent value={FORM_TAB.BASIC} className="mt-4 min-h-0 flex-1 space-y-4 overflow-y-auto">
                 <div className="grid grid-cols-2 gap-6">
                   <FormField
                     control={form.control}
@@ -583,11 +637,9 @@ const CreateVoiceAgentDialog: React.FC<CreateVoiceAgentDialogProps> = ({ isOpen,
                     </FormItem>
                   )}
                 />
-              </div>
+              </TabsContent>
 
-              {/* Configurations */}
-              <div className="space-y-4">
-                <h3 className="text-sm font-semibold">Configurations</h3>
+              <TabsContent value={FORM_TAB.CONFIGURATIONS} className="mt-4 min-h-0 flex-1 space-y-4 overflow-y-auto">
                 <div className="grid grid-cols-2 gap-6">
                   <FormField
                     control={form.control}
@@ -754,11 +806,9 @@ const CreateVoiceAgentDialog: React.FC<CreateVoiceAgentDialogProps> = ({ isOpen,
                       </div>
                     )}
                 </div>
-              </div>
+              </TabsContent>
 
-              {/* Phone Numbers */}
-              <div className="space-y-4">
-                <h3 className="text-sm font-semibold">Phone Numbers</h3>
+              <TabsContent value={FORM_TAB.PHONE_NUMBERS} className="mt-4 min-h-0 flex-1 space-y-4 overflow-y-auto">
                 <div className="grid grid-cols-1 gap-6">
                   <FormField
                     control={form.control}
@@ -788,11 +838,9 @@ const CreateVoiceAgentDialog: React.FC<CreateVoiceAgentDialogProps> = ({ isOpen,
                     )}
                   />
                 </div>
-              </div>
+              </TabsContent>
 
-              {/* Language Configuration */}
-              <div className="space-y-4">
-                <h3 className="text-sm font-semibold">Language Configuration</h3>
+              <TabsContent value={FORM_TAB.LANGUAGES} className="mt-4 min-h-0 flex-1 space-y-4 overflow-y-auto">
                 <FormField
                   control={form.control}
                   name="supported_languages"
@@ -856,11 +904,9 @@ const CreateVoiceAgentDialog: React.FC<CreateVoiceAgentDialogProps> = ({ isOpen,
                     </FormItem>
                   )}
                 />
-              </div>
+              </TabsContent>
 
-              {/* Behavior */}
-              <div className="space-y-4">
-                <h3 className="text-sm font-semibold">Behavior</h3>
+              <TabsContent value={FORM_TAB.BEHAVIOR} className="mt-4 min-h-0 flex-1 space-y-4 overflow-y-auto">
                 <FormField
                   control={form.control}
                   name="system_prompt"
@@ -902,11 +948,9 @@ const CreateVoiceAgentDialog: React.FC<CreateVoiceAgentDialogProps> = ({ isOpen,
                     </FormItem>
                   )}
                 />
-              </div>
+              </TabsContent>
 
-              {/* Advanced */}
-              <div className="space-y-4">
-                <h3 className="text-sm font-semibold">Advanced</h3>
+              <TabsContent value={FORM_TAB.ADVANCED} className="mt-4 min-h-0 flex-1 space-y-4 overflow-y-auto">
                 <FormField
                   control={form.control}
                   name="conversation_config"
@@ -932,10 +976,10 @@ const CreateVoiceAgentDialog: React.FC<CreateVoiceAgentDialogProps> = ({ isOpen,
                     </FormItem>
                   )}
                 />
-              </div>
-            </div>
+              </TabsContent>
+            </Tabs>
 
-            <DialogFooter>
+            <DialogFooter className="shrink-0 pt-4">
               <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
                 Cancel
               </Button>

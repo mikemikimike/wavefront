@@ -15,6 +15,7 @@ import { Label } from '@app/components/ui/label';
 import { Slider } from '@app/components/ui/slider';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@app/components/ui/select';
 import { Checkbox } from '@app/components/ui/checkbox';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@app/components/ui/tabs';
 import {
   useGetLLMConfigs,
   useGetSttConfigs,
@@ -32,10 +33,24 @@ import { popupCodeMirrorExtensions } from '@app/lib/code-mirror';
 import { langs } from '@uiw/codemirror-extensions-langs';
 import CodeMirror from '@uiw/react-codemirror';
 import React, { useEffect, useState } from 'react';
-import { useForm } from 'react-hook-form';
+import { FieldErrors, useForm } from 'react-hook-form';
 import { z } from 'zod';
 
 const E164_REGEX = /^\+[1-9]\d{1,14}$/;
+
+const FORM_TAB = {
+  BASIC: 'basic',
+  CONFIGURATIONS: 'configurations',
+  PHONE_NUMBERS: 'phone-numbers',
+  LANGUAGES: 'languages',
+  BEHAVIOR: 'behavior',
+  ADVANCED: 'advanced',
+  TOOLS: 'tools',
+} as const;
+
+type FormTab = (typeof FORM_TAB)[keyof typeof FORM_TAB];
+
+const isFormTab = (value: string): value is FormTab => Object.values(FORM_TAB).includes(value as FormTab);
 
 const updateVoiceAgentSchema = z.object({
   name: z.string().min(1, 'Name is required').max(100, 'Name must be 100 characters or less'),
@@ -57,6 +72,24 @@ const updateVoiceAgentSchema = z.object({
 
 type UpdateVoiceAgentInput = z.infer<typeof updateVoiceAgentSchema>;
 
+const FIELD_TAB_MAP: Record<keyof UpdateVoiceAgentInput, FormTab> = {
+  name: FORM_TAB.BASIC,
+  description: FORM_TAB.BASIC,
+  status: FORM_TAB.BASIC,
+  llm_config_id: FORM_TAB.CONFIGURATIONS,
+  tts_config_id: FORM_TAB.CONFIGURATIONS,
+  stt_config_id: FORM_TAB.CONFIGURATIONS,
+  telephony_config_id: FORM_TAB.CONFIGURATIONS,
+  tts_voice_ids: FORM_TAB.CONFIGURATIONS,
+  inbound_numbers: FORM_TAB.PHONE_NUMBERS,
+  outbound_numbers: FORM_TAB.PHONE_NUMBERS,
+  supported_languages: FORM_TAB.LANGUAGES,
+  default_language: FORM_TAB.LANGUAGES,
+  system_prompt: FORM_TAB.BEHAVIOR,
+  welcome_message: FORM_TAB.BEHAVIOR,
+  conversation_config: FORM_TAB.ADVANCED,
+};
+
 interface EditVoiceAgentDialogProps {
   isOpen: boolean;
   onOpenChange: (open: boolean) => void;
@@ -75,6 +108,7 @@ const EditVoiceAgentDialog: React.FC<EditVoiceAgentDialogProps> = ({
   const { notifySuccess, notifyError } = useNotifyStore();
   const { selectedApp } = useDashboardStore();
   const [updating, setUpdating] = useState(false);
+  const [activeTab, setActiveTab] = useState<FormTab>(FORM_TAB.BASIC);
 
   // Fetch configs for dropdowns
   const { data: llmConfigs = [] } = useGetLLMConfigs(appId);
@@ -140,6 +174,7 @@ const EditVoiceAgentDialog: React.FC<EditVoiceAgentDialogProps> = ({
         default_language: agent.default_language || 'en',
       });
       setVoiceIdState(agent.tts_voice_ids || { en: '' });
+      setActiveTab(FORM_TAB.BASIC);
     }
   }, [isOpen, agent, form]);
 
@@ -179,6 +214,13 @@ const EditVoiceAgentDialog: React.FC<EditVoiceAgentDialogProps> = ({
 
   const setSttParameter = (key: string, value: unknown) => {
     setSttParameters((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const onInvalid = (errors: FieldErrors<UpdateVoiceAgentInput>) => {
+    const firstErrorField = Object.keys(errors)[0] as keyof UpdateVoiceAgentInput | undefined;
+    if (firstErrorField && FIELD_TAB_MAP[firstErrorField]) {
+      setActiveTab(FIELD_TAB_MAP[firstErrorField]);
+    }
   };
 
   const onSubmit = async (data: UpdateVoiceAgentInput) => {
@@ -555,18 +597,32 @@ const EditVoiceAgentDialog: React.FC<EditVoiceAgentDialogProps> = ({
 
   return (
     <Dialog open={isOpen} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[90vh] max-w-4xl min-w-0 overflow-y-auto lg:max-w-4xl">
-        <DialogHeader>
+      <DialogContent className="flex h-[760px] max-h-[calc(100vh-2rem)] max-w-4xl min-w-0 flex-col overflow-hidden lg:max-w-4xl">
+        <DialogHeader className="shrink-0">
           <DialogTitle>Edit Voice Agent</DialogTitle>
           <DialogDescription>Update the voice agent configuration for {selectedApp?.app_name}</DialogDescription>
         </DialogHeader>
 
         <Form {...form}>
-          <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
-            <div className="space-y-6">
-              {/* Basic Information */}
-              <div className="space-y-4">
-                <h3 className="text-sm font-semibold">Basic Information</h3>
+          <form onSubmit={form.handleSubmit(onSubmit, onInvalid)} className="flex min-h-0 flex-1 flex-col">
+            <Tabs
+              value={activeTab}
+              onValueChange={(value) => {
+                if (isFormTab(value)) setActiveTab(value);
+              }}
+              className="flex min-h-0 flex-1 flex-col overflow-hidden"
+            >
+              <TabsList className="grid w-full shrink-0 grid-cols-7">
+                <TabsTrigger value={FORM_TAB.BASIC}>Basic Info</TabsTrigger>
+                <TabsTrigger value={FORM_TAB.CONFIGURATIONS}>Configurations</TabsTrigger>
+                <TabsTrigger value={FORM_TAB.PHONE_NUMBERS}>Phone Numbers</TabsTrigger>
+                <TabsTrigger value={FORM_TAB.LANGUAGES}>Languages</TabsTrigger>
+                <TabsTrigger value={FORM_TAB.BEHAVIOR}>Behavior</TabsTrigger>
+                <TabsTrigger value={FORM_TAB.ADVANCED}>Advanced</TabsTrigger>
+                <TabsTrigger value={FORM_TAB.TOOLS}>Tools</TabsTrigger>
+              </TabsList>
+
+              <TabsContent value={FORM_TAB.BASIC} className="mt-4 min-h-0 flex-1 space-y-4 overflow-y-auto">
                 <div className="grid grid-cols-2 gap-6">
                   <FormField
                     control={form.control}
@@ -626,11 +682,9 @@ const EditVoiceAgentDialog: React.FC<EditVoiceAgentDialogProps> = ({
                     </FormItem>
                   )}
                 />
-              </div>
+              </TabsContent>
 
-              {/* Configurations */}
-              <div className="space-y-4">
-                <h3 className="text-sm font-semibold">Configurations</h3>
+              <TabsContent value={FORM_TAB.CONFIGURATIONS} className="mt-4 min-h-0 flex-1 space-y-4 overflow-y-auto">
                 <div className="grid grid-cols-2 gap-6">
                   <FormField
                     control={form.control}
@@ -797,11 +851,9 @@ const EditVoiceAgentDialog: React.FC<EditVoiceAgentDialogProps> = ({
                       </div>
                     )}
                 </div>
-              </div>
+              </TabsContent>
 
-              {/* Phone Numbers */}
-              <div className="space-y-4">
-                <h3 className="text-sm font-semibold">Phone Numbers</h3>
+              <TabsContent value={FORM_TAB.PHONE_NUMBERS} className="mt-4 min-h-0 flex-1 space-y-4 overflow-y-auto">
                 <div className="grid grid-cols-1 gap-6">
                   <FormField
                     control={form.control}
@@ -831,11 +883,9 @@ const EditVoiceAgentDialog: React.FC<EditVoiceAgentDialogProps> = ({
                     )}
                   />
                 </div>
-              </div>
+              </TabsContent>
 
-              {/* Language Configuration */}
-              <div className="space-y-4">
-                <h3 className="text-sm font-semibold">Language Configuration</h3>
+              <TabsContent value={FORM_TAB.LANGUAGES} className="mt-4 min-h-0 flex-1 space-y-4 overflow-y-auto">
                 <FormField
                   control={form.control}
                   name="supported_languages"
@@ -899,11 +949,9 @@ const EditVoiceAgentDialog: React.FC<EditVoiceAgentDialogProps> = ({
                     </FormItem>
                   )}
                 />
-              </div>
+              </TabsContent>
 
-              {/* Behavior */}
-              <div className="space-y-4">
-                <h3 className="text-sm font-semibold">Behavior</h3>
+              <TabsContent value={FORM_TAB.BEHAVIOR} className="mt-4 min-h-0 flex-1 space-y-4 overflow-y-auto">
                 <FormField
                   control={form.control}
                   name="system_prompt"
@@ -945,11 +993,9 @@ const EditVoiceAgentDialog: React.FC<EditVoiceAgentDialogProps> = ({
                     </FormItem>
                   )}
                 />
-              </div>
+              </TabsContent>
 
-              {/* Advanced */}
-              <div className="space-y-4">
-                <h3 className="text-sm font-semibold">Advanced</h3>
+              <TabsContent value={FORM_TAB.ADVANCED} className="mt-4 min-h-0 flex-1 space-y-4 overflow-y-auto">
                 <FormField
                   control={form.control}
                   name="conversation_config"
@@ -975,16 +1021,14 @@ const EditVoiceAgentDialog: React.FC<EditVoiceAgentDialogProps> = ({
                     </FormItem>
                   )}
                 />
-              </div>
+              </TabsContent>
 
-              {/* Tools Section */}
-              <div className="space-y-4">
-                <h3 className="text-sm font-semibold">Tools & Function Calling</h3>
+              <TabsContent value={FORM_TAB.TOOLS} className="mt-4 min-h-0 flex-1 space-y-4 overflow-y-auto">
                 <VoiceAgentToolsManager appId={appId} agentId={agent.id} />
-              </div>
-            </div>
+              </TabsContent>
+            </Tabs>
 
-            <DialogFooter>
+            <DialogFooter className="shrink-0 pt-4">
               <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
                 Cancel
               </Button>

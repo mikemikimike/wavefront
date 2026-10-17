@@ -89,8 +89,8 @@ const readDynamicQueryQueryFn = async (datasourceId: string, queryId: string): P
 
 const getDatasourceResourcesQueryFn = async (datasourceId: string): Promise<string[]> => {
   const response = await floConsoleService.datasourcesService.getDatasourceResources(datasourceId);
-  if (response.data?.data?.data?.resources) {
-    return response.data.data.data.resources;
+  if (response.data?.data?.resources) {
+    return response.data.data.resources;
   }
   return [];
 };
