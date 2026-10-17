@@ -44,12 +44,9 @@ RUN --mount=from=ghcr.io/astral-sh/uv:0.12.24,source=/uv,target=/bin/uv uv sync 
 # runtime.
 RUN rm uv.lock
 
-# Download the tiktoken encoding file and NLTK data
+# Download the tiktoken encoding file
 RUN mkdir -p /root/.cache/tiktoken
 RUN /app/.venv/bin/python -c "import tiktoken; enc = tiktoken.encoding_for_model('gpt-4')"
-# NLTK data goes under /app (not /root/nltk_data) so the UID 1000 runtime user can read it
-ENV NLTK_DATA=/app/nltk_data
-RUN /app/.venv/bin/python -c "import nltk; nltk.download('punkt', download_dir='/app/nltk_data'); nltk.download('averaged_perceptron_tagger', download_dir='/app/nltk_data')"
 
 WORKDIR /app/background_jobs/rag_ingestion
 
