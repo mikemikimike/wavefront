@@ -66,6 +66,11 @@ RUN chmod +x /app/scripts/floware-init.sh
 
 RUN uv sync --package floware --frozen --no-dev
 
+# uv.lock covers the whole workspace, but only this app's deps are in the venv;
+# scanners (AWS Inspector) report every package in it. `uv run --frozen --no-sync`
+# does not need it.
+RUN rm uv.lock
+
 # spaCy model for Presidio, which arrives with the flo-ai[guardrails] extra
 # that guardrails_module depends on. The model is not a pip dependency of it,
 # and Presidio downloads one on first use when absent -- which would put a
