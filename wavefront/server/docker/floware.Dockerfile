@@ -2,9 +2,13 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY --from=ghcr.io/astral-sh/uv:0.12.10 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.12.24 /uv /uvx /bin/
 
-RUN apt-get update && apt-get install -y \
+# Keep uv/pip download caches out of the image layers
+ENV UV_NO_CACHE=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     libpq-dev \
     gcc \
     libgl1 \
@@ -21,7 +25,13 @@ RUN curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor
     echo "deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/microsoft-archive-keyring.gpg] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" > /etc/apt/sources.list.d/microsoft-ubuntu-jammy-prod.list && \
     apt-get update && \
     ACCEPT_EULA=Y apt-get install -y msodbcsql18 && \
+    apt-get purge -y --auto-remove gnupg2 apt-transport-https && \
     rm -rf /var/lib/apt/lists/*
+
+# The app runs from the uv venv, so drop the base image's system pip/setuptools/wheel
+# (and the vendored copies of urllib3, msgpack, etc. they carry)
+RUN pip uninstall -y pip setuptools wheel && \
+    rm -rf /usr/local/lib/python3.11/ensurepip/_bundled
 
 COPY wavefront/server/pyproject.toml wavefront/server/uv.lock ./
 
@@ -65,7 +75,8 @@ RUN uv sync --package floware --frozen --no-dev
 # and then shells out to `python -m pip install`, and a uv-created venv has no
 # pip, so the download fails without it.
 RUN uv pip install pip && \
-    /app/.venv/bin/python -m spacy download en_core_web_lg
+    /app/.venv/bin/python -m spacy download en_core_web_lg && \
+    uv pip uninstall pip
 
 # Create a non-root user and change ownership of the /app directory
 RUN useradd -m -u 1000 floware && \
