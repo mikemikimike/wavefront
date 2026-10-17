@@ -1,7 +1,19 @@
-FROM python:3.11-slim-buster
+# bookworm: buster (Debian 10) is end-of-life and no longer receives security fixes
+FROM python:3.11-slim-bookworm
 
 # Copy UV from official image
-COPY --from=ghcr.io/astral-sh/uv:0.12.10 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.12.24 /uv /uvx /bin/
+
+# Keep uv/pip download caches out of the image layers
+ENV UV_NO_CACHE=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+
+# The app runs from the uv venv, so drop the base image's system pip/setuptools/wheel
+# (and the vendored copies of urllib3, msgpack, etc. they carry)
+RUN pip uninstall -y pip setuptools wheel && \
+    rm -rf /usr/local/lib/python3.11/ensurepip/_bundled
 
 # Set working directory
 WORKDIR /app
