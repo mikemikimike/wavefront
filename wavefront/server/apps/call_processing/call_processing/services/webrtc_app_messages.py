@@ -10,6 +10,8 @@ Inbound (browser -> pipeline), via ``client.sendClientMessage(type, data)``:
     ``interrupt``    {}  stop the bot's current speech (orb tap).
     ``switch_agent`` {agent_id}  hot-swap the voice agent in this live room. The
         target must be on the room's allowlist (enforced by the swap controller).
+    ``app_event_ack`` {id, ok, error?, result?}  the app's answer to an ``app_event``.
+        It becomes the result of the LLM tool call that raised the event.
 
 Outbound (pipeline -> browser), via ``RTVIProcessor.send_server_message``:
     ``agent_state``  {state: listening | thinking | speaking}
@@ -19,6 +21,10 @@ Outbound (pipeline -> browser), via ``RTVIProcessor.send_server_message``:
     ``agent_switching``      {agent_id}  a swap started (show a pending state)
     ``agent_changed``        {agent_id, agent_name}  the swap finished
     ``agent_switch_failed``  {code, message}  the previous agent keeps running
+    ``app_event``    {id, name, args, step}  an app tool (tool_type 'app') was called
+        by the LLM; the app acts on it (navigate, save, ...) and replies with
+        ``app_event_ack``. ``step`` is the step the call was made on, so the app can
+        drop events from a page the customer already left.
 
 One room is one pipeline: pages only send ``set_context`` / ``switch_agent``;
 nothing here creates or restarts a conversation.
@@ -34,7 +40,9 @@ Language handling has two modes, chosen per room at creation
 
 from __future__ import annotations
 
+import asyncio
 import re
+import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -67,6 +75,7 @@ from call_processing.services.tts_service import TTSServiceFactory
 MSG_SET_CONTEXT = 'set_context'
 MSG_INTERRUPT = 'interrupt'
 MSG_SWITCH_AGENT = 'switch_agent'
+MSG_APP_EVENT_ACK = 'app_event_ack'
 
 # Outbound message types
 MSG_AGENT_STATE = 'agent_state'
@@ -76,6 +85,7 @@ MSG_LANGUAGE_CHANGED = 'language_changed'
 MSG_AGENT_SWITCHING = 'agent_switching'
 MSG_AGENT_CHANGED = 'agent_changed'
 MSG_AGENT_SWITCH_FAILED = 'agent_switch_failed'
+MSG_APP_EVENT = 'app_event'
 
 STATE_LISTENING = 'listening'
 STATE_THINKING = 'thinking'
@@ -130,6 +140,27 @@ def parse_set_context(data: Any) -> Optional[SetContext]:
         instruction=_clean_str(data.get('instruction')),
         allowed_tools=allowed,
     )
+
+
+def parse_app_event_ack(data: Any) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """Validate an ``app_event_ack`` payload.
+
+    Returns ``(event_id, tool_result)`` where ``tool_result`` always has a boolean
+    ``success``; None when the payload is unusable.
+    """
+    if not isinstance(data, dict):
+        return None
+    event_id = _clean_str(data.get('id'))
+    if event_id is None:
+        return None
+    result = data.get('result')
+    payload: Dict[str, Any] = dict(result) if isinstance(result, dict) else {}
+    if data.get('ok') is True:
+        payload['success'] = True
+    else:
+        payload['success'] = False
+        payload.setdefault('error', _clean_str(data.get('error')) or 'rejected')
+    return event_id, payload
 
 
 # ------------------------------------------------------------- prompt / tools
@@ -296,6 +327,8 @@ class BrowserSessionMessenger:
         self._on_switch_agent: Optional[Callable[[str], Awaitable[None]]] = None
         self._swapping = False
         self._deferred_context: Optional[SetContext] = None
+        # App tool calls waiting for the browser's ack, keyed by event id
+        self._pending_app_events: Dict[str, 'asyncio.Future[Dict[str, Any]]'] = {}
 
     def set_switch_handler(
         self, handler: Optional[Callable[[str], Awaitable[None]]]
@@ -350,6 +383,60 @@ class BrowserSessionMessenger:
             {'type': MSG_AGENT_SWITCH_FAILED, 'code': code, 'message': message}
         )
 
+    async def emit_app_event(
+        self, name: str, args: Dict[str, Any], timeout: float = 4.0
+    ) -> Dict[str, Any]:
+        """Raise an app tool call to the browser and wait for its ack.
+
+        Returns the tool result for the LLM: ``{'success': True, ...}`` when the app
+        accepted the event, otherwise ``{'success': False, 'error': ...}`` (rejected,
+        timeout, no app attached, or the agent is being swapped).
+        """
+        if self._task is None:
+            return {'success': False, 'error': 'no_app'}
+        if self._swapping:
+            return {'success': False, 'error': 'agent_swapping'}
+
+        event_id = uuid.uuid4().hex
+        future: 'asyncio.Future[Dict[str, Any]]' = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._pending_app_events[event_id] = future
+        step = self._last_context.step if self._last_context else None
+        try:
+            await self._send(
+                {
+                    'type': MSG_APP_EVENT,
+                    'id': event_id,
+                    'name': name,
+                    'args': args or {},
+                    'step': step,
+                }
+            )
+            return await asyncio.wait_for(future, timeout)
+        except asyncio.TimeoutError:
+            logger.warning(f"App event '{name}' ({event_id}) was not acknowledged")
+            return {'success': False, 'error': 'timeout'}
+        finally:
+            self._pending_app_events.pop(event_id, None)
+
+    def resolve_app_event(self, event_id: str, result: Dict[str, Any]) -> bool:
+        """Complete a pending app event. False when it is unknown or already done."""
+        future = self._pending_app_events.get(event_id)
+        if future is None or future.done():
+            return False
+        future.set_result(result)
+        return True
+
+    def fail_pending_app_events(self, error: str) -> None:
+        """Fail every waiting app tool call (swap started, call ended)."""
+        for future in list(self._pending_app_events.values()):
+            if not future.done():
+                future.set_result({'success': False, 'error': error})
+
+    async def close(self) -> None:
+        self.fail_pending_app_events('session_closed')
+
     # -------------------------------------------------------------- inbound
 
     async def handle_client_message(self, message: Any) -> None:
@@ -372,6 +459,13 @@ class BrowserSessionMessenger:
                 await self.apply_context(ctx)
             elif msg_type == MSG_INTERRUPT:
                 await self.interrupt()
+            elif msg_type == MSG_APP_EVENT_ACK:
+                ack = parse_app_event_ack(data)
+                if ack is None:
+                    logger.warning(f'Ignoring invalid app_event_ack payload: {data!r}')
+                    return
+                if not self.resolve_app_event(*ack):
+                    logger.info(f'app_event_ack {ack[0]} matched no pending event')
             elif msg_type == MSG_SWITCH_AGENT:
                 agent_id = parse_switch_agent(data)
                 if agent_id is None:
@@ -422,6 +516,8 @@ class BrowserSessionMessenger:
 
     def begin_swap(self) -> None:
         self._swapping = True
+        # The outgoing agent's tool calls can no longer be answered into its context
+        self.fail_pending_app_events('agent_swapping')
 
     def will_reopen_step(self) -> bool:
         """True when ``finish_swap`` will apply a step context (and so speak)."""

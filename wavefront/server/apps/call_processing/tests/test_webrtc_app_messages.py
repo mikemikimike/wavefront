@@ -1,6 +1,8 @@
 """Browser app messages: set_context parsing, step overlay, tool allowlist, captions."""
 
+import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.frames.frames import LLMMessagesAppendFrame
@@ -15,9 +17,14 @@ from call_processing.services.webrtc_app_messages import (
     apply_step_overlay,
     build_step_overlay,
     filter_function_schemas,
+    parse_app_event_ack,
     parse_set_context,
     parse_switch_agent,
     strip_step_overlay,
+)
+from call_processing.services.tool_wrapper_service import (
+    AppToolWrapper,
+    ToolWrapperFactory,
 )
 
 
@@ -474,3 +481,179 @@ async def test_finish_swap_without_any_step_does_nothing():
     await messenger.finish_swap()
 
     assert task.frames == []
+
+
+# ------------------------------------------------------------------ app tools
+
+
+def test_parse_app_event_ack():
+    assert parse_app_event_ack({'id': 'e1', 'ok': True}) == ('e1', {'success': True})
+    assert parse_app_event_ack({'id': 'e1', 'ok': True, 'result': {'score': 90}}) == (
+        'e1',
+        {'score': 90, 'success': True},
+    )
+    assert parse_app_event_ack({'id': 'e1', 'ok': False, 'error': 'bad date'}) == (
+        'e1',
+        {'success': False, 'error': 'bad date'},
+    )
+    assert parse_app_event_ack({'id': 'e1'}) == (
+        'e1',
+        {'success': False, 'error': 'rejected'},
+    )
+    assert parse_app_event_ack({'ok': True}) is None
+    assert parse_app_event_ack('x') is None
+
+
+async def _next_event(task):
+    for _ in range(50):
+        if task.rtvi.sent:
+            return task.rtvi.sent[-1]
+        await asyncio.sleep(0)
+    raise AssertionError('no app_event was sent')
+
+
+async def test_app_event_is_sent_with_step_and_resolved_by_ack():
+    messenger, _, task = _messenger()
+    await messenger.handle_client_message(_msg('set_context', {'step': 'language'}))
+
+    call = asyncio.create_task(
+        messenger.emit_app_event('select_language', {'language': 'hi'})
+    )
+    event = await _next_event(task)
+
+    assert event['type'] == 'app_event'
+    assert event['name'] == 'select_language'
+    assert event['args'] == {'language': 'hi'}
+    assert event['step'] == 'language'
+
+    await messenger.handle_client_message(
+        _msg('app_event_ack', {'id': event['id'], 'ok': True})
+    )
+    assert await call == {'success': True}
+
+
+async def test_app_event_rejection_reaches_the_tool_result():
+    messenger, _, task = _messenger()
+    call = asyncio.create_task(messenger.emit_app_event('submit_identity_field', {}))
+    event = await _next_event(task)
+
+    await messenger.handle_client_message(
+        _msg(
+            'app_event_ack',
+            {
+                'id': event['id'],
+                'ok': False,
+                'error': 'no match',
+                'result': {'score': 20},
+            },
+        )
+    )
+    assert await call == {'success': False, 'error': 'no match', 'score': 20}
+
+
+async def test_app_event_times_out_without_an_ack():
+    messenger, _, _ = _messenger()
+
+    result = await messenger.emit_app_event('select_language', {}, timeout=0.01)
+
+    assert result == {'success': False, 'error': 'timeout'}
+    assert messenger._pending_app_events == {}
+
+
+async def test_unknown_or_late_ack_is_ignored():
+    messenger, _, _ = _messenger()
+
+    await messenger.handle_client_message(
+        _msg('app_event_ack', {'id': 'nope', 'ok': True})
+    )
+    await messenger.handle_client_message(_msg('app_event_ack', {'ok': True}))
+
+    assert messenger._pending_app_events == {}
+
+
+async def test_swap_start_fails_pending_app_events():
+    messenger, _, task = _messenger()
+    call = asyncio.create_task(messenger.emit_app_event('select_language', {}))
+    await _next_event(task)
+
+    messenger.begin_swap()
+
+    assert await call == {'success': False, 'error': 'agent_swapping'}
+    # And no new event goes out while swapping
+    assert await messenger.emit_app_event('select_language', {}) == {
+        'success': False,
+        'error': 'agent_swapping',
+    }
+
+
+async def test_close_fails_pending_app_events():
+    messenger, _, task = _messenger()
+    call = asyncio.create_task(messenger.emit_app_event('select_language', {}))
+    await _next_event(task)
+
+    await messenger.close()
+
+    assert await call == {'success': False, 'error': 'session_closed'}
+
+
+async def test_app_tool_wrapper_without_a_browser_fails_with_no_app():
+    wrapper = AppToolWrapper('select_language')
+
+    assert await wrapper.execute({'language': 'hi'}) == {
+        'success': False,
+        'error': 'no_app',
+    }
+
+
+async def test_app_tool_function_stays_quiet_on_success_and_speaks_on_failure():
+    class FakeMessenger:
+        def __init__(self, result):
+            self.result = result
+            self.calls = []
+
+        async def emit_app_event(self, name, args, timeout):
+            self.calls.append((name, args, timeout))
+            return self.result
+
+    async def run(result, **config):
+        messenger = FakeMessenger(result)
+        tool = {
+            'name': 'select_language',
+            'description': 'd',
+            'tool_type': 'app',
+            'config': {'ack_timeout_s': 2, **config},
+            'parameter_schema': {'properties': {}, 'required': []},
+        }
+        schemas, registrations = ToolWrapperFactory.create_all_tool_functions(
+            [tool], messenger_getter=lambda: messenger
+        )
+        callback = AsyncMock()
+        await registrations[0][1](
+            SimpleNamespace(arguments={'language': 'hi'}, result_callback=callback)
+        )
+        return schemas, messenger, callback
+
+    schemas, messenger, callback = await run({'success': True})
+    assert [s.name for s in schemas] == ['select_language']
+    assert messenger.calls == [('select_language', {'language': 'hi'}, 2.0)]
+    callback.assert_awaited_once()
+    assert callback.await_args.args == ({'success': True},)
+    assert callback.await_args.kwargs['properties'].run_llm is False
+
+    _, _, callback = await run({'success': False, 'error': 'timeout'})
+    assert callback.await_args.kwargs['properties'].run_llm is True
+
+    _, _, callback = await run({'success': True}, speak_on_success=True)
+    assert callback.await_args.kwargs['properties'].run_llm is True
+
+
+async def test_app_tools_respect_the_step_allowlist():
+    messenger, context, _ = _messenger(
+        tools=('select_language', 'submit_identity_field')
+    )
+
+    await messenger.handle_client_message(
+        _msg('set_context', {'step': 'language', 'allowedTools': ['select_language']})
+    )
+
+    assert [t.name for t in context.tools.standard_tools] == ['select_language']

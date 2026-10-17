@@ -333,7 +333,12 @@ class PipecatService:
                 (
                     function_schemas,
                     tool_registrations,
-                ) = ToolWrapperFactory.create_all_tool_functions(tools)
+                ) = ToolWrapperFactory.create_all_tool_functions(
+                    tools,
+                    # App tools talk to the browser; it only exists once the pipeline
+                    # is built, so they look the messenger up when called.
+                    messenger_getter=lambda: shared.messenger,
+                )
 
                 # Register each tool with LLM
                 for tool_name, tool_func in tool_registrations:
@@ -824,6 +829,8 @@ class PipecatService:
         finally:
             if swap_controller:
                 await swap_controller.close()
+            if browser_messenger:
+                await browser_messenger.close()
             await task.cancel()
             if call_evaluation_tasks:
                 await asyncio.gather(*call_evaluation_tasks, return_exceptions=True)

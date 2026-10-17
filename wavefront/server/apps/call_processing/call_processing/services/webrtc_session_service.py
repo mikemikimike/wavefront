@@ -302,6 +302,9 @@ class WebRTCSessionService:
                 allowed_agent_ids=allowed,
                 load_agent_configs=self.voice_agent_cache_service.get_all_agent_configs,
                 on_agent_switched=on_agent_switched,
+                carry_history=self.room_service.get_carry_history_on_swap(
+                    session.room_id
+                ),
             ),
             on_ready=on_ready,
         )

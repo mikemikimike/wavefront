@@ -46,6 +46,9 @@ class CreateRoomRequest(BaseModel):
     # True: the app drives the language via set_context.language, so the agent
     # gets no language-switching rules / detect_and_switch_language tool.
     room_context_handles_language: bool = False
+    # False: a swapped-in agent starts with a clean context instead of inheriting
+    # the conversation so far.
+    carry_history_on_swap: bool = True
 
 
 class OfferBody(BaseModel):
@@ -116,6 +119,7 @@ async def create_room(
         str(body.voice_agent_id),
         allowed_agent_ids=[str(a) for a in body.allowed_agent_ids or []],
         room_context_handles_language=body.room_context_handles_language,
+        carry_history_on_swap=body.carry_history_on_swap,
     )
     return {
         'room_id': room.room_id,

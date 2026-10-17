@@ -18,7 +18,8 @@ Swap order (``AgentSwapController``): build the new stack off to the side
 commit both slots in one synchronous step (no frame can fall between the old
 and the new stack), cut the old agent's speech, stop the old stack (closing its
 STT/TTS websockets) and let the new agent introduce itself with the carried
-conversation history.
+conversation history (rooms created with ``carry_history_on_swap=False`` start
+the new agent with a clean context instead).
 """
 
 from __future__ import annotations
@@ -299,7 +300,11 @@ def build_handoff_history(messages: Sequence[Any]) -> List[Dict[str, str]]:
 
 
 def build_handoff_note(
-    previous_name: str, new_name: str, *, new_step: bool = False
+    previous_name: str,
+    new_name: str,
+    *,
+    new_step: bool = False,
+    carry_history: bool = True,
 ) -> str:
     """System-injected user turn after a hot-swap.
 
@@ -308,6 +313,13 @@ def build_handoff_note(
     ``new_name`` is kept in the signature for callers/tests; unused in the text.
     """
     del new_name  # reserved for logging/callers; never spoken in the note
+    if not carry_history:
+        # Clean context: there is no earlier conversation to refer to
+        return (
+            '[A conversation with the user is starting now and you have no earlier '
+            'history with them. Briefly greet them and help. '
+            'Do not say your agent name.]'
+        )
     previous = f' from {previous_name}' if previous_name else ''
     if new_step:
         # The app moved on: the earlier topic is finished, not something to pick up again
@@ -340,6 +352,8 @@ class SwapOptions:
     max_swaps: int = DEFAULT_MAX_SWAPS
     cooldown_secs: float = DEFAULT_COOLDOWN_SECS
     timeout_secs: float = DEFAULT_SWAP_TIMEOUT_SECS
+    # False: the new agent starts with only its own system prompt (set per room)
+    carry_history: bool = True
 
 
 @dataclass
@@ -492,7 +506,8 @@ class AgentSwapController:
         # 3. Commit. From here on there is no way back, and nothing awaits
         #    between swapping the two slots, so no frame sees a half-swap.
         try:
-            self._seed_context(new_stack, old_stack)
+            if self._options.carry_history:
+                self._seed_context(new_stack, old_stack)
             old_a = self._slot_a.commit(prepared_a)
             old_b = self._slot_b.commit(prepared_b)
         except BaseException:
@@ -572,15 +587,22 @@ class AgentSwapController:
         #    step opener (queued by ``finish_swap``) makes it speak, so the note
         #    only needs to be in the context (run_llm=False).
         reopen = self._messenger.will_reopen_step()
-        note = build_handoff_note(
-            old_stack.agent_name, new_stack.agent_name, new_step=reopen
-        )
-        await self._task.queue_frame(
-            LLMMessagesAppendFrame(
-                messages=[{'role': 'user', 'content': note}],
-                run_llm=not reopen,
+        carry = self._options.carry_history
+        if carry or not reopen:
+            # Without history and with an app step to open, the step opener alone
+            # starts the new agent: there is nothing to hand over.
+            note = build_handoff_note(
+                old_stack.agent_name,
+                new_stack.agent_name,
+                new_step=reopen,
+                carry_history=carry,
             )
-        )
+            await self._task.queue_frame(
+                LLMMessagesAppendFrame(
+                    messages=[{'role': 'user', 'content': note}],
+                    run_llm=not reopen,
+                )
+            )
 
         # 7. Bookkeeping + tell the browser.
         callback = self._options.on_agent_switched

@@ -232,3 +232,23 @@ def test_language_flag_reads_false_for_old_or_missing_rooms(rooms):
 
     assert rooms.get_room_context_handles_language(room.room_id) is False
     assert rooms.get_room_context_handles_language(uuid.uuid4().hex) is False
+
+
+def test_history_flag_defaults_to_carrying_and_is_stored_per_room(rooms):
+    default = rooms.create_room(AGENT_ID)
+    clean = rooms.create_room(AGENT_ID, carry_history_on_swap=False)
+
+    assert rooms.get_room(default.room_id)['carry_history_on_swap'] is True
+    assert rooms.get_carry_history_on_swap(default.room_id) is True
+    assert rooms.get_room(clean.room_id)['carry_history_on_swap'] is False
+    assert rooms.get_carry_history_on_swap(clean.room_id) is False
+
+
+def test_history_flag_reads_true_for_old_or_missing_rooms(rooms):
+    room = rooms.create_room(AGENT_ID)
+    record = rooms.get_room(room.room_id)
+    del record['carry_history_on_swap']  # a room from before the flag
+    rooms.cache_manager.set_json(rooms._key(room.room_id), record, expiry=600)
+
+    assert rooms.get_carry_history_on_swap(room.room_id) is True
+    assert rooms.get_carry_history_on_swap(uuid.uuid4().hex) is True

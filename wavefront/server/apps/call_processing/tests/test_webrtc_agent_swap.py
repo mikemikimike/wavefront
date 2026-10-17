@@ -32,6 +32,7 @@ from call_processing.services.webrtc_agent_swap import (
     SwapOptions,
     SwappableSlot,
     build_handoff_history,
+    build_handoff_note,
 )
 from call_processing.services.webrtc_app_messages import (
     OVERLAY_END,
@@ -355,6 +356,7 @@ class ControllerHarness:
         inactive=(),
         fail_start=False,
         slow_build: Optional[asyncio.Event] = None,
+        carry_history: bool = True,
     ):
         self.log: List[tuple] = []
         self.messenger = FakeMessenger()
@@ -393,6 +395,7 @@ class ControllerHarness:
             max_swaps=max_swaps,
             cooldown_secs=cooldown,
             timeout_secs=timeout,
+            carry_history=carry_history,
         )
         self.stack = make_stack(A_ID, 'alpha', self.log)
         self.slot_a = SwappableSlot(self.stack.slot_a_processors, name='A')
@@ -509,6 +512,66 @@ async def test_handoff_note_does_not_run_llm_when_an_app_step_will_reopen():
         content = note.messages[0]['content']
         assert 'Do not continue' in content
         assert 'where the conversation left off' not in content
+
+
+async def test_swap_without_history_starts_the_new_agent_clean():
+    async with ControllerHarness(carry_history=False) as h:
+        h.stack.context.set_messages(
+            [
+                {'role': 'system', 'content': 'prompt of alpha'},
+                {'role': 'assistant', 'content': 'Welcome'},
+                {'role': 'user', 'content': 'my secret is 42'},
+            ]
+        )
+
+        await h.switch(B_ID)
+
+        new_stack = h.shared.active_stack
+        assert new_stack.agent_id == B_ID
+        assert new_stack.context.get_messages() == [
+            {'role': 'system', 'content': 'prompt of beta'},
+        ]
+        # The swap itself is unchanged: bookkeeping, rebind and events all happen
+        assert h.controller.swap_count == 1
+        assert h.switched == [B_ID]
+        assert h.messenger.rebound['context'] is new_stack.context
+        assert [e[0] for e in h.messenger.events] == [
+            'switching',
+            'changed',
+            'finish_swap',
+        ]
+        # No earlier conversation to refer to: a fresh-start note that speaks
+        (note,) = [f for f in h.queued if isinstance(f, LLMMessagesAppendFrame)]
+        content = note.messages[0]['content']
+        assert 'no earlier history' in content
+        assert 'took over' not in content and 'alpha' not in content
+        assert note.run_llm is True
+
+
+async def test_swap_without_history_lets_the_app_step_start_the_new_agent():
+    async with ControllerHarness(carry_history=False) as h:
+        h.messenger.reopen = True
+
+        await h.switch(B_ID)
+
+        # The step opener (queued by the messenger) is the only thing that speaks
+        assert [f for f in h.queued if isinstance(f, LLMMessagesAppendFrame)] == []
+        assert h.shared.active_stack.context.get_messages() == [
+            {'role': 'system', 'content': 'prompt of beta'},
+        ]
+        assert h.messenger.events[-1][0] == 'finish_swap'
+
+
+def test_handoff_note_variants():
+    carried = build_handoff_note('alpha', 'beta')
+    assert 'took over' in carried and 'is above' in carried
+
+    fresh = build_handoff_note('alpha', 'beta', carry_history=False)
+    assert 'is above' not in fresh and 'alpha' not in fresh
+    # Fresh start wins over the new-step variant: there is no "so far" to ignore
+    assert fresh == build_handoff_note(
+        'alpha', 'beta', new_step=True, carry_history=False
+    )
 
 
 @pytest.mark.parametrize(

@@ -101,6 +101,17 @@ class TestWebRTCRoomClient:
         }
         assert json.loads(second.content) == {'voice_agent_id': str(AGENT_ID)}
 
+    async def test_create_room_sends_the_history_flag_only_when_false(self, transport):
+        await make_client().create_room(AGENT_ID, carry_history_on_swap=False)
+        await make_client().create_room(AGENT_ID, carry_history_on_swap=True)
+
+        first, second = transport.requests
+        assert json.loads(first.content) == {
+            'voice_agent_id': str(AGENT_ID),
+            'carry_history_on_swap': False,
+        }
+        assert json.loads(second.content) == {'voice_agent_id': str(AGENT_ID)}
+
     async def test_create_room_points_browser_at_floware_when_proxying(self, transport):
         room = await make_client(signaling_via_floware=True).create_room(AGENT_ID)
 
@@ -194,6 +205,7 @@ class TestCreateRoomEndpoint:
             AGENT_ID,
             allowed_agent_ids=[AGENT_ID],
             room_context_handles_language=False,
+            carry_history_on_swap=True,
         )
         assert body['data']['agents'] == [{'id': str(AGENT_ID), 'name': 'Alpha'}]
 
@@ -296,6 +308,19 @@ class TestCreateRoomAllowlist:
         assert (
             room_client.create_room.await_args.kwargs['room_context_handles_language']
             is True
+        )
+
+    async def test_history_flag_defaults_to_carrying_and_is_forwarded_when_off(self):
+        room_client, _ = await self._create([])
+        assert (
+            room_client.create_room.await_args.kwargs['carry_history_on_swap'] is True
+        )
+
+        room_client, _ = await self._create(
+            [], CreateWebRTCRoomPayload(carry_history_on_swap=False)
+        )
+        assert (
+            room_client.create_room.await_args.kwargs['carry_history_on_swap'] is False
         )
 
     async def test_allowlist_is_capped(self):

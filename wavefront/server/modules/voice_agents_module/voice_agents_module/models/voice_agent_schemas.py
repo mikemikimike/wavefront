@@ -169,3 +169,11 @@ class CreateWebRTCRoomPayload(BaseModel):
             "agent's native language switching."
         ),
     )
+    carry_history_on_swap: bool = Field(
+        True,
+        description=(
+            'When the room hot-swaps to another agent, carry the conversation '
+            'so far (user/assistant turns) over to the new agent. Default true. '
+            'Set false to start each swapped-in agent with a clean context.'
+        ),
+    )

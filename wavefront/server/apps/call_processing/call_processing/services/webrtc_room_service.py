@@ -14,6 +14,8 @@ Room record (``webrtc_room:{room_id}``), JSON:
     room_context_handles_language  true when the app drives the language via
                         ``set_context.language`` (no language rules / tool for
                         the agent); absent or false keeps native switching
+    carry_history_on_swap  false: an agent swapped in starts with a clean context;
+                        absent or true carries the conversation over
 
 Peer connections themselves are NOT stored here (aiortc state is in-process);
 ``pc_id`` / ``instance_id`` are kept for diagnostics and sticky-routing errors.
@@ -179,6 +181,7 @@ class WebRTCRoomService:
         voice_agent_id: str,
         allowed_agent_ids: Optional[List[str]] = None,
         room_context_handles_language: bool = False,
+        carry_history_on_swap: bool = True,
     ) -> CreatedRoom:
         """Create a pending room and mint its one-time join token.
 
@@ -188,6 +191,9 @@ class WebRTCRoomService:
 
         ``room_context_handles_language`` makes the app (``set_context.language``)
         the only thing that changes the language, for every agent in this room.
+
+        ``carry_history_on_swap=False`` makes each swapped-in agent start with a
+        clean context instead of the conversation so far.
         """
         room_id = uuid.uuid4().hex
         join_token = secrets.token_urlsafe(32)
@@ -201,6 +207,7 @@ class WebRTCRoomService:
             'active_voice_agent_id': voice_agent_id,
             'swap_count': 0,
             'room_context_handles_language': bool(room_context_handles_language),
+            'carry_history_on_swap': bool(carry_history_on_swap),
             'join_token_hash': hash_join_token(join_token),
             'status': ROOM_STATUS_PENDING,
             'created_at': time.time(),
@@ -275,6 +282,11 @@ class WebRTCRoomService:
         """Whether the app drives this room's language (False if unset/gone)."""
         room = self.get_room(room_id) or {}
         return room.get('room_context_handles_language') is True
+
+    def get_carry_history_on_swap(self, room_id: str) -> bool:
+        """Whether swapped-in agents inherit the conversation (True if unset)."""
+        room = self.get_room(room_id) or {}
+        return room.get('carry_history_on_swap') is not False
 
     def get_room(self, room_id: str) -> Optional[dict]:
         return self.cache_manager.get_json(self._key(room_id))
