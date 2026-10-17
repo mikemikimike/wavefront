@@ -47,7 +47,8 @@ app.use((req, res, next) => {
   express.static(path.join(__dirname, 'dist'), staticOptions)(req, res, next);
 });
 
-app.get('*', (req, res) => {
+// Express 5 (path-to-regexp 8) needs a named wildcard; '/{*splat}' also matches '/'
+app.get('/{*splat}', (req, res) => {
   // Generate nonce for CSP
   const nonce = crypto.randomBytes(16).toString('base64');
   const defaultSrc = `'self'`;

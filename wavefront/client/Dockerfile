@@ -26,7 +26,7 @@ RUN pnpm build
 # Runtime server deps, installed in their own stage so the final image needs no package manager
 FROM node:22-alpine AS runtime-deps
 WORKDIR /app
-RUN npm install --omit=dev --no-audit --no-fund express@^4.22.1 compression@^1.8.1
+RUN npm install --omit=dev --no-audit --no-fund express@^5.1.0 compression@^1.8.1
 
 FROM node:22-alpine
 WORKDIR /app
