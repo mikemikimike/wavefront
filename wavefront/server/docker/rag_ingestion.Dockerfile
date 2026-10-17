@@ -3,16 +3,18 @@
 # marks no-fix. Pinned by digest; bump with `docker pull` + rescan.
 FROM cgr.dev/chainguard/wolfi-base@sha256:256c88bb066424045021090932d50be93c8e3f2ce3586707702a401b146f3e43
 
-# Copy UV from official image
-COPY --from=ghcr.io/astral-sh/uv:0.12.24 /uv /uvx /bin/
-
+# uv is bind-mounted only into the RUN steps that need it (ghcr.io/astral-sh/uv:0.12.24), so the
+# image does not ship the uv binary and the Rust crates it bundles; the app
+# runs straight from the venv.
 # Keep uv/pip download caches out of the image layers; build the venv on the
 # distro's python3.11 rather than a uv-downloaded interpreter (not UV_PYTHON:
 # that would also point `uv pip` at the system interpreter instead of the venv)
 ENV UV_NO_CACHE=1 \
     PIP_NO_CACHE_DIR=1 \
     UV_PYTHON_PREFERENCE=only-system \
-    UV_PYTHON_DOWNLOADS=never
+    UV_PYTHON_DOWNLOADS=never \
+    VIRTUAL_ENV=/app/.venv \
+    PATH=/app/.venv/bin:$PATH
 
 # bash is for the startup script. The app runs from the uv venv, so drop
 # ensurepip's bundled pip/setuptools wheels (they vendor urllib3, msgpack, etc.)
@@ -35,17 +37,19 @@ COPY wavefront/server/modules/common_module ./modules/common_module/
 COPY wavefront/server/scripts/rag_ingestion/startup-rag-ingestion.sh ./background_jobs/rag_ingestion/
 
 # Install dependencies
-RUN uv sync --package rag-ingestion --frozen --no-dev
+RUN --mount=from=ghcr.io/astral-sh/uv:0.12.24,source=/uv,target=/bin/uv uv sync --package rag-ingestion --frozen --no-dev
 
 # uv.lock covers the whole workspace, but only this app's deps are in the venv;
-# scanners (AWS Inspector) report every package in it. `uv run --frozen --no-sync`
-# does not need it.
+# scanners (AWS Inspector) report every package in it, and nothing reads it at
+# runtime.
 RUN rm uv.lock
 
 # Download the tiktoken encoding file and NLTK data
 RUN mkdir -p /root/.cache/tiktoken
 RUN /app/.venv/bin/python -c "import tiktoken; enc = tiktoken.encoding_for_model('gpt-4')"
-RUN /app/.venv/bin/python -c "import nltk; nltk.download('punkt'); nltk.download('averaged_perceptron_tagger')"
+# NLTK data goes under /app (not /root/nltk_data) so the UID 1000 runtime user can read it
+ENV NLTK_DATA=/app/nltk_data
+RUN /app/.venv/bin/python -c "import nltk; nltk.download('punkt', download_dir='/app/nltk_data'); nltk.download('averaged_perceptron_tagger', download_dir='/app/nltk_data')"
 
 WORKDIR /app/background_jobs/rag_ingestion
 
