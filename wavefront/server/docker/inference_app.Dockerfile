@@ -31,6 +31,11 @@ USER appuser
 
 RUN uv sync --package inference-app --frozen --no-dev
 
+# uv.lock covers the whole workspace, but only this app's deps are in the venv;
+# scanners (AWS Inspector) report every package in it. `uv run --frozen --no-sync`
+# does not need it.
+RUN rm uv.lock
+
 # The app runs from the venv; drop pip and ensurepip's bundled wheels from the
 # uv-managed interpreter (they vendor their own urllib3, msgpack, setuptools)
 RUN find "$(uv python dir)" -depth \( -path '*/site-packages/pip' -o -path '*/site-packages/pip-*' -o -path '*/ensurepip/_bundled' \) -exec rm -rf {} +
