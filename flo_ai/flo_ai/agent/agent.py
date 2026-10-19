@@ -281,6 +281,9 @@ class Agent(BaseAgent):
                             )
                             if is_final:
                                 if self.output_schema:
+                                    # A tool loop response is only a draft when a
+                                    # parser is configured; break so the final
+                                    # request can apply the schema to the answer.
                                     break
 
                                 # Ensure act_as is not None (default to 'assistant' if missing)
@@ -471,7 +474,9 @@ class Agent(BaseAgent):
                             f'Tool execution failed: {analysis}', original_error=e
                         )
 
-                # If no tools were called, return conversation history
+                # Without a parser, a direct answer is already complete. With a
+                # parser, continue to the schema-constrained final request even
+                # when the model did not call a tool.
                 if tool_call_count == 0 and not self.output_schema:
                     return self.conversation_history
 
